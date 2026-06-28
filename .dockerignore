@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime data (regenerated on demand)
+data/cache/
+
+# Local team notes / logs / scratch
+.local/
+*.log
+*.output
+
+# OS
+.DS_Store
+
+# Git
+.git/

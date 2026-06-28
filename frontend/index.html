@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>LocustShield — Biocontrol suitability for desert locust</title>
+  <meta name="description" content="Interactive map of the R0 environmental-suitability index, a closed-form function of air temperature and relative humidity, evaluated per location for a chosen region and time." />
+
+  <!-- Leaflet (CDN) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+  <!-- Type: Spectral (display) · IBM Plex Sans (UI) · IBM Plex Mono (instrument readouts) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Spectral:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="style.css?v=8" />
+</head>
+<body>
+  <div class="app" id="app">
+
+    <!-- ============================ TOP HEADER ============================ -->
+    <!-- Product name + tagline supplied by team-lead. The deeper scientific
+         description (R0 definition, data sources, honesty caveats) stays an
+         editable placeholder in the About panel — team-lead injects it later. -->
+    <header class="topbar">
+      <div class="topbar__brand">
+        <span class="topbar__mark" aria-hidden="true">R<sub>0</sub></span>
+        <div class="topbar__id">
+          <h1 class="topbar__title" id="appTitle">LocustShield</h1>
+          <p class="topbar__sub" id="appSub">Biocontrol suitability for desert locust</p>
+        </div>
+      </div>
+
+      <div class="topbar__context">
+        <div class="ctx" id="ctxRegion"><span class="ctx__k">Region</span><span class="ctx__v" id="ctxRegionV">—</span></div>
+        <div class="ctx" id="ctxMode"><span class="ctx__k">Basis</span><span class="ctx__v" id="ctxModeV">—</span></div>
+        <div class="ctx" id="ctxTime"><span class="ctx__k">Time</span><span class="ctx__v mono" id="ctxTimeV">—</span></div>
+      </div>
+
+      <p class="topbar__source mono" id="sourceLine">Source — awaiting field</p>
+    </header>
+
+    <!-- ============================== BODY ============================== -->
+    <div class="body">
+
+      <!-- ----------------------- CONTROL PANEL ----------------------- -->
+      <aside class="panel" id="panel" aria-label="Map controls">
+        <div class="panel__scroll">
+
+          <p class="panel__eyebrow" style="--i:0">Parameters</p>
+
+          <!-- Region -->
+          <section class="field" style="--i:1">
+            <label class="field__label" for="regionSelect">
+              <span class="field__num">01</span> Region
+            </label>
+            <div class="select">
+              <select id="regionSelect" aria-label="Select region"></select>
+              <svg class="select__chev" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 4l4 4 4-4"/></svg>
+            </div>
+          </section>
+
+          <!-- Mode toggle -->
+          <section class="field" style="--i:2">
+            <span class="field__label"><span class="field__num">02</span> Temporal basis</span>
+            <div class="segmented" id="modeToggle" role="radiogroup" aria-label="Temporal basis">
+              <button type="button" class="segmented__opt is-active" data-mode="climatology" role="radio" aria-checked="true">Climatology</button>
+              <button type="button" class="segmented__opt" data-mode="month" role="radio" aria-checked="false">Historical</button>
+            </div>
+          </section>
+
+          <!-- Month -->
+          <section class="field" style="--i:3">
+            <label class="field__label" for="monthRange">
+              <span class="field__num">03</span> Month
+              <span class="field__value mono" id="monthValue">January</span>
+            </label>
+            <input type="range" id="monthRange" min="1" max="12" step="1" value="1" aria-label="Month" />
+            <div class="ticks" id="monthTicks" aria-hidden="true"></div>
+          </section>
+
+          <!-- Year (historical only) -->
+          <section class="field is-disabled" id="yearField" style="--i:4">
+            <label class="field__label" for="yearInput">
+              <span class="field__num">04</span> Year
+              <span class="field__hint" id="yearHint">climatology — disabled</span>
+            </label>
+            <input type="number" id="yearInput" class="numinput mono" min="1981" max="2025" step="1" value="2024" disabled />
+          </section>
+
+          <!-- Map rendering: discrete cells vs the smooth 5-class surface -->
+          <section class="field" style="--i:5">
+            <span class="field__label"><span class="field__num">05</span> Map rendering</span>
+            <div class="segmented" id="viewToggle" role="radiogroup" aria-label="Map rendering">
+              <button type="button" class="segmented__opt is-active" data-view="cells" role="radio" aria-checked="true">Cells</button>
+              <button type="button" class="segmented__opt" data-view="smooth" role="radio" aria-checked="false">Smooth</button>
+            </div>
+          </section>
+
+          <!-- Occurrences -->
+          <section class="field field--row" style="--i:6">
+            <label class="switch" for="occToggle">
+              <input type="checkbox" id="occToggle" />
+              <span class="switch__track"><span class="switch__thumb"></span></span>
+              <span class="switch__label">Observed occurrences</span>
+            </label>
+          </section>
+
+          <!-- Compute -->
+          <section class="field" style="--i:7">
+            <button type="button" class="compute" id="computeBtn">
+              <span class="compute__label">Compute field</span>
+              <span class="compute__meta mono" id="computeMeta">—</span>
+            </button>
+          </section>
+
+          <!-- Meta readout -->
+          <section class="readout" id="metaBox" style="--i:8" hidden>
+            <h2 class="readout__title">Field metadata</h2>
+            <dl class="readout__grid mono" id="metaGrid"></dl>
+          </section>
+
+          <!-- About / caveats -->
+          <section class="about" style="--i:9">
+            <button type="button" class="about__toggle" id="aboutToggle" aria-expanded="false" aria-controls="aboutBody">
+              <span>About &amp; caveats</span>
+              <svg class="about__chev" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 4l4 4 4-4"/></svg>
+            </button>
+            <div class="about__body" id="aboutBody" hidden>
+              <p class="about__lede" id="aboutLede"></p>
+              <h3 class="about__h">Caveats</h3>
+              <ul class="about__caveats" id="caveatList"></ul>
+              <p class="about__foot mono" id="aboutSource"></p>
+            </div>
+          </section>
+
+        </div>
+      </aside>
+
+      <!-- ================================ MAP ================================ -->
+      <main class="map-wrap">
+        <div id="map" aria-label="Suitability map"></div>
+
+        <!-- Basemap labels toggle (top-right) -->
+        <button type="button" class="labels-toggle" id="labelsToggle" aria-pressed="false" title="Toggle place labels">
+          <svg viewBox="0 0 16 16" aria-hidden="true" width="13" height="13"><path d="M2 4h12M2 8h8M2 12h10"/></svg>
+          <span>Labels</span>
+        </button>
+
+        <!-- Floating figure-style legend (bottom-left) -->
+        <section class="map-legend" id="legendBox" hidden aria-label="Legend">
+          <header class="map-legend__head">
+            <span class="map-legend__time mono" id="legendTime">—</span>
+            <span class="map-legend__region" id="legendRegion">—</span>
+          </header>
+          <h2 class="map-legend__title">Suitability index R<sub>0</sub></h2>
+          <ul class="map-legend__list" id="legendList"></ul>
+          <p class="map-legend__note mono" id="legendNote">R<sub>0</sub> = 1 — suitability threshold</p>
+        </section>
+
+        <!-- Coordinate / value readout -->
+        <div class="cursor-readout mono" id="cursorReadout" aria-hidden="true">
+          <span id="curLat">—</span> <span id="curLon">—</span>
+        </div>
+
+        <!-- Loading overlay -->
+        <div class="loader" id="loader" hidden>
+          <div class="loader__card">
+            <div class="loader__grid" aria-hidden="true">
+              <span></span><span></span><span></span><span></span>
+              <span></span><span></span><span></span><span></span>
+              <span></span><span></span><span></span><span></span>
+              <span></span><span></span><span></span><span></span>
+            </div>
+            <p class="loader__text mono" id="loaderText">Computing suitability field…</p>
+          </div>
+        </div>
+      </main>
+
+    </div>
+  </div>
+
+  <script src="app.js?v=9" defer></script>
+</body>
+</html>

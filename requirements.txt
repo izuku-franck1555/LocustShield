@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+numpy
+scipy
+pillow
+requests
+geopandas
+pygadm
+shapely
+pytest

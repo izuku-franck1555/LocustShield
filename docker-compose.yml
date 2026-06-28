@@ -1,0 +1,13 @@
+services:
+  locustshield:
+    build: .
+    container_name: locustshield
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    volumes:
+      # Persist the on-disk NASA POWER climate cache across restarts.
+      - locustshield-cache:/app/data/cache
+
+volumes:
+  locustshield-cache:
