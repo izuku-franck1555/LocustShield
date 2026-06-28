@@ -339,6 +339,8 @@ const state = {
   surfaceActive: false,// true when the smooth surface overlay is the visible layer (continuous mode)
   surface: null,       // cached smooth CONTINUOUS surface (classified uses discrete cells)
   labelsOn: false,     // basemap place-labels toggle
+  hasResult: false,    // a field has been computed at least once (dismisses the welcome state)
+  dirty: false,        // a query param changed since the last compute → result is stale
 };
 
 let map, cellLayer = null, boundaryLayer = null, occLayer = null,
@@ -699,6 +701,10 @@ async function compute() {
       fetchSurface(state.region, params),
     ]);
     renderField(data, surface);
+    state.hasResult = true;
+    state.dirty = false;
+    const welcome = $('#welcome'); if (welcome) welcome.hidden = true;  // dismiss first-run state
+    updateRunButton();
   } catch (err) {
     console.error('[R0] compute failed:', err);
     showLoader('Could not compute the field — check the backend connection, then retry.', true);
@@ -714,9 +720,35 @@ async function compute() {
 /* =====================================================================
    Controls wiring
    ===================================================================== */
+function queryTimeLabel() {
+  return state.mode === 'month'
+    ? `${MONTHS_SHORT[state.month - 1]} ${state.year}`
+    : MONTHS_SHORT[state.month - 1];
+}
+
 function updateComputeMeta() {
-  const m = state.mode === 'month' ? `historical ${state.year}` : 'climatology';
-  $('#computeMeta').textContent = `${m} · ${MONTHS_SHORT[state.month - 1]}`;
+  const region = state.region ? state.region.name : 'a region';
+  const time = queryTimeLabel();
+  const meta = $('#computeMeta'); if (meta) meta.textContent = `${region} · ${time}`;
+  const wl = $('#welcomeBtnLabel'); if (wl) wl.textContent = `Compute ${region} · ${time}`;
+  updateRunButton();
+}
+
+/* The Compute CTA reflects state: first run, stale (params changed), or up-to-date. */
+function updateRunButton() {
+  const btn = $('#computeBtn'); if (!btn) return;
+  const label = btn.querySelector('.compute__label');
+  if (!state.hasResult)      { if (label) label.textContent = 'Compute suitability map'; btn.classList.remove('is-stale'); }
+  else if (state.dirty)      { if (label) label.textContent = 'Update map';              btn.classList.add('is-stale'); }
+  else                       { if (label) label.textContent = 'Recompute';              btn.classList.remove('is-stale'); }
+}
+
+/* Mark the shown result stale when a QUERY param (region / time) changes.
+   Display options (Cells/Smooth, occurrences, labels) never mark dirty. */
+function markDirty() {
+  if (!state.hasResult) return;
+  state.dirty = true;
+  updateRunButton();
 }
 
 function setMode(mode) {
@@ -733,6 +765,7 @@ function setMode(mode) {
   yearInput.disabled = !historical;
   $('#yearHint').textContent = historical ? `1981 – 2025` : 'climatology — disabled';
   updateComputeMeta();
+  markDirty();
 }
 
 function setView(view) {
@@ -771,17 +804,21 @@ function setMonth(m) {
   state.month = m;
   $('#monthValue').textContent = MONTHS[m - 1];
   const range = $('#monthRange');
+  range.value = m;                       // keep the thumb in sync (e.g. on init defaults)
   const pct = ((m - 1) / 11) * 100;
   range.style.setProperty('--p', `${pct}%`);
   updateComputeMeta();
+  markDirty();
 }
 
 function wireControls() {
   // Region
   const sel = $('#regionSelect');
   sel.addEventListener('change', () => {
+    // Region change STAGES the query; it does not auto-compute. The user runs it.
     state.region = state.regions.find((r) => r.code === sel.value) || state.regions[0];
-    compute(); // region change recomputes the field
+    updateComputeMeta();
+    markDirty();
   });
 
   // Basemap place-labels toggle
@@ -806,16 +843,19 @@ function wireControls() {
     state.year = clamp(parseInt(yearInput.value, 10) || 2024, 1981, 2025);
     yearInput.value = state.year;
     updateComputeMeta();
+    markDirty();
   });
 
-  // Occurrences
+  // Occurrences (a DISPLAY option — applies to the current result, no recompute)
   $('#occToggle').addEventListener('change', (e) => {
     state.showOcc = e.target.checked;
-    loadOccurrences();
+    if (state.hasResult) loadOccurrences();
   });
 
-  // Compute
+  // Compute (panel CTA + welcome-card primary action)
   $('#computeBtn').addEventListener('click', compute);
+  const welcomeBtn = $('#welcomeCompute');
+  if (welcomeBtn) welcomeBtn.addEventListener('click', compute);
 
   // About
   const aboutToggle = $('#aboutToggle');
@@ -841,10 +881,13 @@ async function init() {
   const titleEl = $('#appTitle'); if (titleEl && CONFIG.brand) titleEl.textContent = CONFIG.brand.title;
   const subEl = $('#appSub');     if (subEl && CONFIG.brand) subEl.innerHTML = CONFIG.brand.sub.replace(/R0\b/, 'R<sub>0</sub>');
 
-  setMonth(1);
+  setMonth(7);                 // a representative default month (not computed yet)
   setMode('climatology');
   setView('cells');
-  setLabels(true);     // place-labels ON by default (toggle to hide)
+  setLabels(true);             // place-labels ON by default (toggle to hide)
+
+  // Open on the locust belt — an inviting overview, NOT a precomputed country.
+  map.fitBounds([[-6, -18], [33, 56]], { padding: [20, 20], animate: false });
 
   // Populate regions
   try {
@@ -858,15 +901,14 @@ async function init() {
   sel.innerHTML = state.regions
     .map((r) => `<option value="${r.code}">${r.name}</option>`)
     .join('');
-  state.region = state.regions[0];
-  if (state.region) {
-    sel.value = state.region.code;
-    $('#ctxRegionV').textContent = state.region.name;
-  }
-  renderCaveats(null); // seed About copy before first compute
+  // Pre-select a representative region (NOT computed) so the first run is one click.
+  state.region = state.regions.find((r) => r.code === 'KEN') || state.regions[0];
+  if (state.region) sel.value = state.region.code;
 
-  // First field
-  await compute();
+  renderCaveats(null);         // seed About copy before first compute
+  updateComputeMeta();         // populate the Compute / welcome button labels
+
+  // No auto-compute: the user runs the field from the welcome card or the panel CTA.
 }
 
 if (document.readyState === 'loading') {

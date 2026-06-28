@@ -17,7 +17,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Spectral:wght@400;500;600&display=swap" rel="stylesheet" />
 
-  <link rel="stylesheet" href="style.css?v=8" />
+  <link rel="stylesheet" href="style.css?v=9" />
 </head>
 <body>
   <div class="app" id="app">
@@ -51,7 +51,8 @@
       <aside class="panel" id="panel" aria-label="Map controls">
         <div class="panel__scroll">
 
-          <p class="panel__eyebrow" style="--i:0">Parameters</p>
+          <!-- ===== QUERY: what to compute (region + time) ===== -->
+          <p class="panel__eyebrow" style="--i:0">Set up the map</p>
 
           <!-- Region -->
           <section class="field" style="--i:1">
@@ -92,9 +93,20 @@
             <input type="number" id="yearInput" class="numinput mono" min="1981" max="2025" step="1" value="2024" disabled />
           </section>
 
-          <!-- Map rendering: discrete cells vs the smooth 5-class surface -->
+          <!-- Compute — the primary action (runs the query above) -->
           <section class="field" style="--i:5">
-            <span class="field__label"><span class="field__num">05</span> Map rendering</span>
+            <button type="button" class="compute" id="computeBtn">
+              <span class="compute__label">Compute suitability map</span>
+              <span class="compute__meta mono" id="computeMeta">—</span>
+            </button>
+          </section>
+
+          <!-- ===== DISPLAY: how to show the result (instant, no recompute) ===== -->
+          <p class="panel__eyebrow" style="--i:6">Display</p>
+
+          <!-- Map rendering: discrete cells vs the smooth 5-class surface -->
+          <section class="field" style="--i:7">
+            <span class="field__label">Map rendering</span>
             <div class="segmented" id="viewToggle" role="radiogroup" aria-label="Map rendering">
               <button type="button" class="segmented__opt is-active" data-view="cells" role="radio" aria-checked="true">Cells</button>
               <button type="button" class="segmented__opt" data-view="smooth" role="radio" aria-checked="false">Smooth</button>
@@ -102,7 +114,7 @@
           </section>
 
           <!-- Occurrences -->
-          <section class="field field--row" style="--i:6">
+          <section class="field field--row" style="--i:8">
             <label class="switch" for="occToggle">
               <input type="checkbox" id="occToggle" />
               <span class="switch__track"><span class="switch__thumb"></span></span>
@@ -110,22 +122,14 @@
             </label>
           </section>
 
-          <!-- Compute -->
-          <section class="field" style="--i:7">
-            <button type="button" class="compute" id="computeBtn">
-              <span class="compute__label">Compute field</span>
-              <span class="compute__meta mono" id="computeMeta">—</span>
-            </button>
-          </section>
-
           <!-- Meta readout -->
-          <section class="readout" id="metaBox" style="--i:8" hidden>
+          <section class="readout" id="metaBox" style="--i:9" hidden>
             <h2 class="readout__title">Field metadata</h2>
             <dl class="readout__grid mono" id="metaGrid"></dl>
           </section>
 
           <!-- About / caveats -->
-          <section class="about" style="--i:9">
+          <section class="about" style="--i:10">
             <button type="button" class="about__toggle" id="aboutToggle" aria-expanded="false" aria-controls="aboutBody">
               <span>About &amp; caveats</span>
               <svg class="about__chev" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 4l4 4 4-4"/></svg>
@@ -150,6 +154,21 @@
           <svg viewBox="0 0 16 16" aria-hidden="true" width="13" height="13"><path d="M2 4h12M2 8h8M2 12h10"/></svg>
           <span>Labels</span>
         </button>
+
+        <!-- First-run welcome / empty state (dismissed on first compute).
+             EDITABLE COPY — team-lead may localise the title/text. -->
+        <div class="welcome" id="welcome">
+          <div class="welcome__card">
+            <p class="welcome__eyebrow mono">Get started</p>
+            <h2 class="welcome__title">Map biocontrol suitability</h2>
+            <p class="welcome__text">See where and when conditions favour the biocontrol fungus against desert locust. Choose a <strong>region</strong> and <strong>month</strong> on the left, then compute the suitability map.</p>
+            <button type="button" class="welcome__btn" id="welcomeCompute">
+              <span id="welcomeBtnLabel">Compute</span>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h9M8.5 4l4 4-4 4"/></svg>
+            </button>
+            <p class="welcome__hint mono">First compute can take ~10s — live NASA POWER climate.</p>
+          </div>
+        </div>
 
         <!-- Floating figure-style legend (bottom-left) -->
         <section class="map-legend" id="legendBox" hidden aria-label="Legend">
