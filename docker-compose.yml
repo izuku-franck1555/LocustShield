@@ -5,6 +5,13 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    environment:
+      # Basemap key. Compose substitutes this from the host environment or from
+      # a gitignored ./.env beside this file; the default keeps it EMPTY so a
+      # missing key degrades to the keyless basemap instead of failing the
+      # build. Listed explicitly (not env_file:) so only this one variable is
+      # passed into the container.
+      - CARTO_API_KEY=${CARTO_API_KEY:-}
     volumes:
       # Persist the on-disk NASA POWER climate cache across restarts.
       - locustshield-cache:/app/data/cache

@@ -34,6 +34,24 @@ const CONFIG = {
          L.imageOverlay when the backend endpoint is live, else cell fallback). --- */
   USE_SURFACE: true,            // try GET /api/r0_surface; fall back to cells
 
+  /* --- Climate source + timing ---------------------------------------
+         The real capability list comes from GET /api/sources. `sourcesFallback`
+         is ONLY the degrade path for a server that predates that endpoint — in
+         that case the high-resolution option is shown *disabled* rather than
+         offered and silently served from the coarse source.
+         A first high-resolution compute reads large rasters, so the client
+         timeout has to sit well above the ~15-60 s that costs. --- */
+  FETCH_TIMEOUT: 240000,        // ms — compute calls (/api/r0, /api/r0_surface)
+  POINT_TIMEOUT: 12000,         // ms — hover probe (/api/r0_point)
+  PROBE_DEBOUNCE: 160,          // ms — hover debounce before a point request
+  sourcesFallback: [
+    {
+      id: 'power', label: 'NASA POWER', resolution: '~55 km',
+      supports_climatology: true, year_min: 1981, year_max: 2025,
+      notes: 'Monthly means on a coarse global grid.',
+    },
+  ],
+
   /* --- Continuous colour ramp — DIVERGING, anchored on the R0 = 1 decision
          break and tightened to the live data range (~0.75–1.05) so the
          variation actually reads instead of washing out. Colours align with
@@ -61,9 +79,9 @@ const CONFIG = {
       "establish and help suppress a locust outbreak; where R0 < 1 (blue) it is unlikely " +
       "to persist. Pick a region and month to see where and when a Green Muscle " +
       "application is climatically favourable. This is a relative suitability index for " +
-      "planning, not a validated forecast; computed from live NASA POWER climate it " +
-      "reproduces the published spatial pattern but reads lower in absolute terms (less " +
-      "red) than the original 1 km study.",
+      "planning, not a validated forecast. Maps are computed on demand at ~1 km from " +
+      "CHELSA V2.1, falling back to NASA POWER (~55 km) for periods CHELSA does not " +
+      "cover; the map always reports the source it actually used.",
     sourceNote:
       'Model: Kamga et al. 2022, Scientific Reports 12:7535 ' +
       '(doi.org/10.1038/s41598-022-11424-0).',
@@ -72,8 +90,9 @@ const CONFIG = {
   /* --- Caveats shown if a response omits meta.caveats --- */
   caveatsFallback: [
     'Relative suitability index for planning — not a validated forecast of locust presence or control success.',
-    'Macroclimatic, monthly-mean basis (NASA POWER); sub-monthly or forecast use is an extrapolation.',
-    'Reproduces the published spatial pattern but reads lower in absolute terms than the 1 km source study (live humidity differs).',
+    'Macroclimatic, monthly-mean basis; sub-monthly or forecast use is an extrapolation.',
+    'Climate: CHELSA V2.1 ~1 km (climatology 1981–2010; monthly 1979–2018, plus 2019 Jan–Apr), with NASA POWER ~55 km used automatically for periods CHELSA does not cover.',
+    'The published figures show large areas in the top class (R0 ≥ 1.1). That class requires relative humidity above ~93%; measured monthly-mean humidity reaches only ~75% (CHELSA) / ~83% (NASA POWER), so it does not occur here. The spatial pattern reproduces the published maps; the absolute class values do not.',
     'Parameters follow the reference R script (Kamga et al. 2022).',
   ],
 };
@@ -89,6 +108,16 @@ const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December'];
 const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const esc = (s) => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/* Per-source UI framing. Everything factual (label, resolution, year span,
+   climatology support) is read from /api/sources — this only supplies the
+   speed/detail trade-off wording the capability list does not carry. */
+const SOURCE_UI = {
+  chelsa: { prefix: 'High resolution', order: 0 },
+  power:  { prefix: 'Fast',            order: 1 },
+};
 
 /* Deterministic pseudo-random from coordinates (stable per cell) */
 function hash2(x, y) {
@@ -288,10 +317,53 @@ function buildMockOccurrences(region, field) {
 /* =====================================================================
    API layer  ——  live fetch with graceful mock fallback
    ===================================================================== */
-async function apiGet(path) {
-  const res = await fetch(CONFIG.API_BASE + path, { headers: { Accept: 'application/json' } });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+/* fetch + an explicit timeout. The browser default is far too eager for a first
+   high-resolution compute (raster read + R0 + PNG), so every call carries its
+   own budget: long for compute, short for the hover probe. */
+async function apiGet(path, timeout = CONFIG.FETCH_TIMEOUT, signal) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(new Error('timeout')), timeout);
+  if (signal) signal.addEventListener('abort', () => ctl.abort(), { once: true });
+  try {
+    const res = await fetch(CONFIG.API_BASE + path, {
+      headers: { Accept: 'application/json' }, signal: ctl.signal,
+    });
+    if (!res.ok) {
+      // Carry the server's own explanation: a 4xx here is usually a precise
+      // refusal ("that year is outside this source") that the UI should relay
+      // verbatim rather than replace with a generic failure.
+      let detail = '';
+      try { detail = (await res.json()).detail || ''; } catch (_) { /* not JSON */ }
+      const err = new Error(detail || `HTTP ${res.status}`);
+      err.status = res.status;
+      err.detail = detail;
+      throw err;
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* A definite server-side refusal (this query cannot be served by this source),
+   as opposed to a transport failure or a missing endpoint. */
+function isRefusal(err) {
+  return !!(err && err.status >= 400 && err.status < 500 && err.status !== 404);
+}
+
+/* Query string shared by /api/r0, /api/r0_surface and /api/r0_point.
+   `source` and `scale` are additive: a backend that predates them ignores the
+   extra params, which is exactly the graceful-degrade path we want. */
+function queryFor(region, params, extra) {
+  const q = new URLSearchParams({
+    region: region.code, level: 0, mode: params.mode, month: params.month,
+  });
+  if (params.mode === 'month') q.set('year', params.year);
+  if (params.ramp)   q.set('ramp', params.ramp);
+  if (params.source) q.set('source', params.source);
+  if (params.scale)  q.set('scale', params.scale);
+  Object.entries(extra || {}).forEach(([k, v]) => q.set(k, v));
+  return q;
 }
 
 async function getData(path, mockFn, latency = CONFIG.mockLatency) {
@@ -309,14 +381,37 @@ const api = {
   regions: () =>
     getData('/api/regions', () => ({ presets: MOCK_REGIONS }), 120),
 
-  r0: (region, params) => {
-    const q = new URLSearchParams({
-      region: region.code, level: 0, mode: params.mode,
-      month: params.month, ramp: params.ramp,
-    });
-    if (params.mode === 'month') q.set('year', params.year);
-    return getData(`/api/r0?${q}`, () => buildMockField(region, params));
+  /* Runtime config (basemap credentials). The key is served at runtime and is
+     never stored in this file — see loadBasemapConfig. */
+  config: () => apiGet('/api/config', 5000),
+
+  /* Capability list. A server without this endpoint is not an error — it means
+     only the coarse source exists, and the UI says so rather than guessing. */
+  sources: () => apiGet('/api/sources', 15000),
+
+  /* Pre-flight for ONE time slice: which source would serve it, and why not the
+     other. Renders nothing and returns instantly, so the UI can warn about a
+     fallback BEFORE the user pays for a multi-second compute. It runs the
+     backend's own resolution logic, so its verdict cannot drift from what the
+     render endpoints actually do — that is why it, not a client-side rule, is
+     the authority for which source we request. */
+  coverage: (mode, month, year, source) => {
+    const q = new URLSearchParams({ mode, month, source });
+    if (mode === 'month') q.set('year', year);
+    return apiGet(`/api/coverage?${q}`, 15000);
   },
+
+  r0: (region, params) =>
+    getData(`/api/r0?${queryFor(region, params)}`, () => buildMockField(region, params)),
+
+  /* Single-point value probe — the hover readout when a raster is displayed and
+     there is no per-cell geometry to hit-test. */
+  point: (region, params, lat, lon, signal) =>
+    apiGet(
+      `/api/r0_point?${queryFor(region, params, {
+        lat: lat.toFixed(4), lon: lon.toFixed(4),
+      })}`,
+      CONFIG.POINT_TIMEOUT, signal),
 
   occurrences: (region, field) =>
     getData(`/api/occurrences?region=${region.code}`,
@@ -332,19 +427,286 @@ const state = {
   mode: 'climatology',
   month: 1,
   year: 2024,
-  view: 'cells',       // 'cells' = discrete cells (grid) · 'smooth' = vivid 5-class surface
+  view: 'cells',       // 'cells' = discrete cells (grid) · 'smooth' = the surface raster
+  source: 'auto',      // 'auto' | a capability id ('chelsa' | 'power')
+  scale: 'absolute',   // 'absolute' = fixed 5 classes · 'relative' = per-map stretch
   showOcc: false,
-  field: null,         // last /api/r0 response
+  field: null,         // last /api/r0 response (cell geometry) — null for a raster-only source
   legendMap: {},       // cls -> color
-  surfaceActive: false,// true when the smooth surface overlay is the visible layer (continuous mode)
-  surface: null,       // cached smooth CONTINUOUS surface (classified uses discrete cells)
+  surfaceActive: false,// true when the surface raster is the visible layer
+  surface: null,       // cached surface raster response
   labelsOn: false,     // basemap place-labels toggle
   hasResult: false,    // a field has been computed at least once (dismisses the welcome state)
   dirty: false,        // a query param changed since the last compute → result is stale
+
+  /* --- source capabilities + provenance of the DISPLAYED result --- */
+  sources: [],         // capability list from /api/sources
+  sourcesLive: false,  // the endpoint answered (false → only the fallback list)
+  requestedSource: null, // the source id asked for on the last compute
+  servedSource: null,  // the source id the response says produced the map
+  provNote: null,      // { text, warn } — a substitution the user must see
+  pointProbe: false,   // hover reads /api/r0_point (no cell geometry to hit-test)
+  coverage: null,      // last /api/coverage verdict for the pending query
+  coverageKey: null,   // the query that verdict belongs to (guards against staleness)
+  coverageLive: true,  // the endpoint exists (false → fall back to local rules)
+  basemap: { key: null, provider: 'carto' },  // from /api/config at runtime
 };
+
+/* Identity of the current time slice + source selection. Coverage is only
+   trusted while this matches, so an in-flight or stale verdict is never
+   applied to a different query. */
+function queryKey() {
+  return [state.mode, state.month, state.mode === 'month' ? state.year : '-', state.source].join('|');
+}
 
 let map, cellLayer = null, boundaryLayer = null, occLayer = null,
     surfaceLayer = null, labelsLayer = null;
+
+/* =====================================================================
+   CLIMATE SOURCE  ——  capability lookup + honest fallback resolution.
+
+   Rule for the whole module: the UI may never imply a source that did not
+   produce the map. Two separate checks enforce that —
+     1. resolveSource()  — BEFORE the request, from /api/sources capabilities,
+        so an unsupported year is announced rather than discovered.
+     2. reconcileProvenance() — AFTER the response, from meta.source, so a
+        server-side substitution we did not predict is still surfaced.
+   ===================================================================== */
+function sourceCap(id) {
+  return state.sources.find((s) => s && s.id === id) || null;
+}
+
+/* Compact resolution for tight chrome (buttons, hints): the capability list
+   carries a precise string like "~1 km (30 arcsec)"; the parenthetical is
+   detail that belongs in the metadata panel, not on a button. */
+function shortRes(cap) {
+  if (!cap || !cap.resolution) return '';
+  return String(cap.resolution).replace(/\s*\(.*?\)\s*/g, '').trim();
+}
+
+/* Human label for a capability, e.g. "NASA POWER 0.5°×0.625°". */
+function sourceName(id, withRes = true) {
+  const c = sourceCap(id);
+  if (!c) return id || 'unknown source';
+  return withRes && c.resolution ? `${c.label} ${shortRes(c)}` : c.label;
+}
+
+/* Dropdown option text: "High resolution · ~1 km (30 arcsec) — CHELSA V2.1".
+   The resolution string is whatever the capability list reports, verbatim. */
+function sourceOptionText(cap) {
+  const prefix = (SOURCE_UI[cap.id] || {}).prefix;
+  return [prefix, cap.resolution].filter(Boolean).join(' · ') + ` — ${cap.label}`;
+}
+
+/* Does the high-resolution source cover the current slice, judged locally?
+   Month-precise: a source can be complete through one year and publish only
+   part of the next, so a year-only test would claim coverage it does not have.
+   This is the FALLBACK path — /api/coverage is preferred when available. */
+function chelsaCoversLocally(cap) {
+  if (!cap) return false;
+  if (state.mode === 'climatology') return cap.supports_climatology !== false;
+
+  const y = state.year;
+  const lo = cap.year_min == null ? 1979 : cap.year_min;
+  if (y < lo) return false;
+
+  // Years where every month is published.
+  if (cap.year_max_complete != null && y <= cap.year_max_complete) return true;
+
+  // A partially published year covers only its stated month range.
+  const partial = (cap.partial_years || {})[String(y)];
+  if (partial) {
+    return state.month >= partial.month_min && state.month <= partial.month_max;
+  }
+  // Older payload with no month-level detail: fall back to the year bound.
+  if (cap.year_max_complete == null && cap.year_max != null) return y <= cap.year_max;
+  return false;
+}
+
+/* Which source will actually serve the CURRENT query, and why not the other.
+   Prefers the backend's own verdict (/api/coverage) so the warning shown here
+   cannot disagree with what the render endpoints do. Falls back to the local
+   capability rules when that endpoint is absent or its answer is stale. */
+function resolveSource() {
+  const wanted = state.source;
+  const powerId = sourceCap('power') ? 'power' : ((state.sources[0] || {}).id || 'power');
+
+  if (wanted !== 'auto' && wanted !== 'chelsa') {
+    return { id: wanted, reason: null, auto: false, reasonText: null };
+  }
+  const auto = wanted === 'auto';
+  const hi = sourceCap('chelsa');
+  if (!hi) return { id: powerId, reason: 'unavailable', auto, reasonText: null };
+
+  // Backend verdict, but only for the query it was actually asked about.
+  const cov = state.coverage;
+  if (cov && state.coverageKey === queryKey()) {
+    if (cov.chelsa_available) return { id: 'chelsa', reason: null, auto, reasonText: null };
+    // would_error === true means the backend would refuse an explicit request
+    // for the high-resolution source; we ask for the coarse one instead and say
+    // so, rather than sending a request we know will fail.
+    return {
+      id: cov.resolved_source || powerId,
+      reason: 'coverage', auto,
+      reasonText: cov.chelsa_reason || cov.note || null,
+    };
+  }
+
+  // Local fallback.
+  if (chelsaCoversLocally(hi)) return { id: hi.id, reason: null, auto, reasonText: null };
+  return {
+    id: powerId,
+    reason: state.mode === 'climatology' ? 'climatology' : 'year',
+    auto, reasonText: null,
+  };
+}
+
+/* Ask the backend which source serves the pending query. Debounced by the
+   caller; safe to call redundantly (a matching key short-circuits). */
+let coverageSeq = 0;
+async function refreshCoverage() {
+  if (!state.sources.length) return;
+  if (!sourceCap('chelsa') || !state.coverageLive) return;   // nothing to arbitrate
+  const key = queryKey();
+  if (state.coverageKey === key && state.coverage) return;
+  const seq = ++coverageSeq;
+  try {
+    const cov = await api.coverage(state.mode, state.month, state.year, state.source);
+    if (seq !== coverageSeq) return;            // a newer query superseded this
+    state.coverage = cov;
+    state.coverageKey = key;
+  } catch (err) {
+    if (err && err.status === 404) {
+      state.coverageLive = false;               // older server: use local rules
+      console.info('[R0] /api/coverage unavailable — using local coverage rules');
+    } else {
+      console.warn('[R0] coverage check failed:', err.message);
+    }
+    if (seq !== coverageSeq) return;
+    state.coverage = null; state.coverageKey = null;
+  }
+  updateSourceNote();
+  updateComputeMeta();
+}
+
+let coverageTimer = null;
+function scheduleCoverage() {
+  clearTimeout(coverageTimer);
+  // Invalidate immediately so a stale verdict is never shown for a new query.
+  if (state.coverageKey !== queryKey()) { state.coverage = null; state.coverageKey = null; }
+  coverageTimer = setTimeout(refreshCoverage, 140);
+}
+
+/* Read the source id back OUT of a response. The contract carries meta.source;
+   accept an explicit meta.source_id when a backend supplies one. */
+function detectServedSource(meta) {
+  if (!meta) return null;
+  if (meta.source_id) return String(meta.source_id).toLowerCase();
+  const s = String(meta.source || '').toLowerCase();
+  if (s.includes('chelsa')) return 'chelsa';
+  if (s.includes('power')) return 'power';
+  return null;
+}
+
+/* The inline note under the source control, written BEFORE the compute so a
+   fallback is never a surprise. Never alarming — it states the substitution
+   and the resolution the user will actually get. */
+function updateSourceNote() {
+  const el = $('#srcNote');
+  if (!el) return;
+  if (!state.sources.length) { el.hidden = true; return; }  // capabilities not loaded yet
+  const r = resolveSource();
+  const hi = sourceCap('chelsa');
+  const got = sourceName(r.id);
+  let html = '', warn = false;
+
+  if (r.reasonText) {
+    // The backend's own explanation, verbatim. Only the connective is ours, so
+    // the stated reason can never drift from the actual coverage rules.
+    warn = true;
+    html = `${esc(r.reasonText)} — using ${esc(got)}.`;
+  } else if (r.reason === 'year' && hi) {
+    warn = true;
+    html = `<strong>${state.year}</strong>-${String(state.month).padStart(2, '0')} is not in ` +
+      `${esc(hi.label)} — using ${esc(got)}.`;
+  } else if (r.reason === 'climatology' && hi) {
+    warn = true;
+    html = `${esc(hi.label)} has no climatology — using ${esc(got)}.`;
+  } else if (r.reason === 'unavailable') {
+    // Not a fallback the user chose: the server simply offers one source.
+    html = state.sourcesLive
+      ? `Only ${esc(got)} is offered by this server.`
+      : `This server predates the source API — ${esc(got)} only.`;
+  } else if (r.id === 'chelsa') {
+    html = `${r.auto ? 'Auto → ' : ''}${esc(got)}. First compute for a ` +
+      `region/month reads the rasters (~15–60 s), then it is cached.`;
+  } else {
+    html = `${r.auto ? 'Auto → ' : ''}${esc(got)}.`;
+  }
+
+  el.innerHTML = html;
+  el.classList.toggle('note--warn', warn);
+  el.hidden = false;
+
+  // Year bounds hint reflects whichever sources are actually on offer.
+  const yh = $('#yearHint');
+  if (yh && state.mode === 'month') yh.textContent = state.sources.map(coverageLabel).join(' · ');
+
+  updateWelcomeHint(r);
+  applyScaleConstraints();
+}
+
+/* First-run hint has to set the right expectation for the resolved source. */
+function updateWelcomeHint(r) {
+  const el = $('#welcomeHint');
+  if (!el) return;
+  const res = r || resolveSource();
+  el.textContent = res.id === 'chelsa'
+    ? `First compute reads ${sourceName(res.id)} rasters — ~15–60 s, then cached.`
+    : `First compute reads live ${sourceName(res.id)} climate — ~10 s.`;
+}
+
+/* AFTER the response: if what came back is not what we asked for, say so.
+   This is the backstop for a substitution decided server-side. */
+function reconcileProvenance(meta) {
+  const served = detectServedSource(meta);
+  state.servedSource = served;
+  const asked = state.requestedSource;
+  if (!served || !asked || served === asked) { state.provNote = null; return; }
+
+  const el = $('#srcNote');
+  if (!el) return;
+  const label = meta && meta.source ? meta.source : sourceName(served);
+  const res = meta && meta.resolution ? ` ${meta.resolution}` : '';
+  state.provNote = { text: `${label}${res}` };
+  el.innerHTML =
+    `Served by <strong>${esc(label)}${esc(res)}</strong>, not ` +
+    `${esc(sourceName(asked, false))} — this map is ${esc(label)} data.`;
+  el.classList.add('note--warn');
+  el.hidden = false;
+}
+
+/* Build the source dropdown from the capability list. */
+function renderSourceOptions() {
+  const sel = $('#sourceSelect');
+  if (!sel) return;
+  const ordered = state.sources.slice().sort((a, b) =>
+    ((SOURCE_UI[a.id] || {}).order ?? 9) - ((SOURCE_UI[b.id] || {}).order ?? 9));
+
+  const opts = [`<option value="auto">Auto (recommended)</option>`];
+  ordered.forEach((c) => {
+    opts.push(`<option value="${esc(c.id)}">${esc(sourceOptionText(c))}</option>`);
+  });
+  // A server that predates /api/sources still shows the high-resolution option,
+  // disabled — offering it and quietly serving 55 km data would be a lie.
+  if (!sourceCap('chelsa')) {
+    opts.splice(1, 0,
+      `<option value="chelsa" disabled>High resolution · ~1 km (CHELSA) — unavailable</option>`);
+  }
+  sel.innerHTML = opts.join('');
+  if (state.source !== 'auto' && !sourceCap(state.source)) state.source = 'auto';
+  sel.value = state.source;
+}
 
 /* ONE shared value-probe tooltip for the whole cell layer. We manage a single
    L.tooltip instance ourselves (never per-feature) so it is always replaced and
@@ -362,12 +724,103 @@ function hideProbe() {
   if (probeTip && map && map.hasLayer(probeTip)) probeTip.remove();
 }
 
+/* ---------------------------------------------------------------------
+   POINT PROBE (raster sources).
+   A ~1 km raster has no per-cell GeoJSON to hit-test, so the hover value
+   comes from /api/r0_point. Debounced, single-flight (an in-flight request
+   is aborted when the cursor moves on) and — critically — it reuses the SAME
+   single probeTip element as the cell layer, so readouts still cannot
+   accumulate. Stale responses are dropped by sequence number.
+   --------------------------------------------------------------------- */
+let probeTimer = null, probeAbort = null, probeSeq = 0;
+
+function inFieldBounds(latlng) {
+  const bbox = fieldBbox();
+  if (!bbox) return true;
+  const [w, s, e, n] = bbox;
+  return latlng.lat >= s && latlng.lat <= n && latlng.lng >= w && latlng.lng <= e;
+}
+
+function cancelPointProbe() {
+  clearTimeout(probeTimer);
+  probeSeq++;                       // invalidate anything still in flight
+  if (probeAbort) { probeAbort.abort(); probeAbort = null; }
+}
+
+function onProbeMove(ev) {
+  if (!state.pointProbe || !state.region) return;
+  const latlng = ev.latlng;
+  clearTimeout(probeTimer);
+  if (!inFieldBounds(latlng)) { probeSeq++; hideProbe(); return; }
+  probeTimer = setTimeout(() => queryPoint(latlng), CONFIG.PROBE_DEBOUNCE);
+}
+
+async function queryPoint(latlng) {
+  const seq = ++probeSeq;
+  if (probeAbort) probeAbort.abort();
+  probeAbort = new AbortController();
+  const signal = probeAbort.signal;
+
+  // Placeholder in the one existing tooltip — replaced in place, never added to.
+  showProbe(latlng, '<span class="cell-tip__pending">R₀ </span>');
+  try {
+    const params = {
+      mode: state.mode, month: state.month, year: state.year,
+      source: state.servedSource || state.requestedSource || undefined,
+    };
+    const p = await api.point(state.region, params, latlng.lat, latlng.lng, signal);
+    if (seq !== probeSeq) return;                       // a newer hover won
+    showProbe(latlng, cellTooltip(p || {}));
+  } catch (err) {
+    if (seq !== probeSeq || (err && err.name === 'AbortError')) return;
+    showProbe(latlng, '<span class="cell-tip__null">value unavailable here</span>');
+  }
+}
+
+/* Turn the point probe on/off and mirror it in the map cursor. */
+function setPointProbe(on) {
+  state.pointProbe = !!on;
+  const el = document.getElementById('map');
+  if (el) el.classList.toggle('is-probe', !!on);
+  if (!on) { cancelPointProbe(); hideProbe(); }
+}
+
+/* Basemap tile URL for a CARTO style.
+
+   The access key is fetched from /api/config at runtime and is deliberately NOT
+   in this file — it must never be committed. Without a key the SAME tiles still
+   load (watermarked), so a missing key degrades the look, never the map.
+
+   Attribution is NOT optional: CARTO's free tier is conditional on displaying
+   both the CARTO and OpenStreetMap credits, so the attribution control stays. */
+function basemapUrl(style) {
+  const url = `https://{s}.basemaps.cartocdn.com/${style}/{z}/{x}/{y}{r}.png`;
+  const key = state.basemap.key;
+  return key ? `${url}?key=${encodeURIComponent(key)}` : url;
+}
+
+/* Read the basemap credentials before any tile layer is built. Fetching this
+   first (rather than swapping the URL afterwards) matters: L.setUrl re-requests
+   every tile, so a late swap briefly paints the unkeyed, watermarked tiles —
+   which looks like a failure. Short timeout; failure just means no key. */
+async function loadBasemapConfig() {
+  try {
+    const cfg = await api.config();
+    const bm = (cfg && cfg.basemap) || {};
+    if (bm.key) state.basemap.key = bm.key;
+    if (bm.provider) state.basemap.provider = bm.provider;
+  } catch (err) {
+    // Deliberately does not log the endpoint response — it carries a credential.
+    console.info('[R0] no basemap key configured; using unkeyed tiles');
+  }
+}
+
 function initMap() {
   map = L.map('map', { zoomControl: true, attributionControl: true, minZoom: 2 })
     .setView([12, 30], 4);
 
   // Clean, near-white basemap WITHOUT labels — the data is the figure.
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png', {
+  L.tileLayer(basemapUrl('light_nolabels'), {
     subdomains: 'abcd',
     maxZoom: 19,
     attribution:
@@ -380,7 +833,7 @@ function initMap() {
   map.createPane('labelsPane');
   map.getPane('labelsPane').style.zIndex = 550;       // above surface/cells (400), below markers (600)
   map.getPane('labelsPane').style.pointerEvents = 'none';
-  labelsLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png', {
+  labelsLayer = L.tileLayer(basemapUrl('light_only_labels'), {
     subdomains: 'abcd', maxZoom: 19, pane: 'labelsPane', opacity: 0.95,
   });
 
@@ -392,8 +845,15 @@ function initMap() {
     readout.classList.add('is-on');
     $('#curLat').textContent = fmtLat(ev.latlng.lat);
     $('#curLon').textContent = fmtLon(ev.latlng.lng);
+    onProbeMove(ev);            // no-op unless a raster is the probeable layer
   });
-  map.on('mouseout', () => readout.classList.remove('is-on'));
+  map.on('mouseout', () => {
+    readout.classList.remove('is-on');
+    cancelPointProbe();
+    hideProbe();
+  });
+  // Panning/zooming invalidates the pending point under the cursor.
+  map.on('movestart zoomstart', () => { cancelPointProbe(); hideProbe(); });
 
   // Keep the map in sync when the viewport changes size (otherwise Leaflet's
   // panes desync — the surface/cells and the boundary outline can drift apart).
@@ -443,25 +903,63 @@ function fmtLon(v) {
    painting cells. This is additive presentation — it never alters the
    /api/r0 wiring that drives hover/query and the legend.
    ===================================================================== */
-async function fetchSurface(region, params) {
+/* `required` = the raster IS the map (a native high-resolution source has no
+   cell geometry to fall back to), so failures must propagate to the caller
+   instead of degrading to a silent blank. For the coarse source the raster is
+   only the Smooth view, and cells still stand. */
+async function fetchSurface(region, params, required) {
   if (CONFIG.USE_MOCK || !CONFIG.USE_SURFACE) return null;
   try {
-    const q = new URLSearchParams({
-      region: region.code, level: 0, mode: params.mode,
-      month: params.month, ramp: params.ramp,
-    });
-    if (params.mode === 'month') q.set('year', params.year);
-    const res = await fetch(`${CONFIG.API_BASE}/api/r0_surface?${q}`, {
-      headers: { Accept: 'application/json' },
-    });
-    if (!res.ok) return null;
-    const j = await res.json();
-    if (!j || !j.image || !j.bounds) return null;
+    const j = await apiGet(`/api/r0_surface?${queryFor(region, params)}`);
+    if (!j || !j.image || !j.bounds) {
+      if (required) throw new Error('empty surface response');
+      return null;
+    }
     return j;
   } catch (err) {
-    console.warn('[R0] smooth surface unavailable, using cells:', err.message);
+    if (required) throw err;
+    console.warn('[R0] surface unavailable, using cells:', err.message);
     return null;
   }
+}
+
+/* =====================================================================
+   Displayed-result accessors.
+   A result is now one of two shapes: cell geometry (+ optional raster) from
+   the coarse source, or a raster ONLY from a native high-resolution source.
+   Everything downstream reads provenance through these, so the panel, the
+   legend and the topbar can never disagree about what is on screen.
+   ===================================================================== */
+function displayMeta() {
+  const s = state.surface, f = state.field;
+  if (state.surfaceActive && s && s.meta) return s.meta;
+  if (f && f.meta) return f.meta;
+  return (s && s.meta) || null;
+}
+
+function fieldBbox() {
+  if (state.field && state.field.bbox) return state.field.bbox;
+  if (state.surface && state.surface.bbox) return state.surface.bbox;
+  return null;
+}
+
+/* The legend that describes what is PAINTED right now. In relative mode the
+   raster's own breaks are the only truthful ones, so the raster response's
+   legend wins whenever the raster is the visible layer. */
+function displayLegend() {
+  if (state.surfaceActive && state.surface && state.surface.legend) {
+    return state.surface.legend;
+  }
+  if (state.field && state.field.legend) return state.field.legend;
+  return (state.surface && state.surface.legend) || [];
+}
+
+/* Scale of the DISPLAYED map — read from the response, not from the control,
+   so a backend that ignored `scale` cannot leave a "Relative" badge lying. */
+function displayScale() {
+  const m = displayMeta();
+  if (m && m.scale) return String(m.scale).toLowerCase();
+  return 'absolute';   // nothing reported → the fixed classes are what was rendered
 }
 
 /* =====================================================================
@@ -481,31 +979,42 @@ function styleCell(feature) {
   return { className: 'r0-cell', ...grid, fillColor: fill, fillOpacity: surf ? 0 : 0.92 };
 }
 
+/* Shared by the cell hit-test and the 1 km point probe — both deliver the same
+   {r0, t, rh} shape, so the readout is identical whichever probe produced it. */
 function cellTooltip(p) {
-  if (p.r0 == null) return '<span class="cell-tip__null">no data</span>';
-  return `<span class="cell-tip__r0">R₀ ${p.r0.toFixed(2)}</span>` +
-    ` · T ${p.t.toFixed(1)}°C · RH ${Math.round(p.rh)}%`;
+  if (!p || p.r0 == null) return '<span class="cell-tip__null">no data</span>';
+  const bits = [`<span class="cell-tip__r0">R₀ ${Number(p.r0).toFixed(2)}</span>`];
+  if (p.t != null)  bits.push(`T ${Number(p.t).toFixed(1)}°C`);
+  if (p.rh != null) bits.push(`RH ${Math.round(Number(p.rh))}%`);
+  return bits.join(' · ');
 }
 
 function renderField(data, surface) {
-  state.field = data;
-  state.legendMap = {};
-  (data.legend || []).forEach((l) => { state.legendMap[l.cls] = l.color; });
+  state.field = data || null;
   state.surface = surface || null;
-  const haveSurface = !!(surface && surface.image && surface.bounds);
-  // View design: CELLS = discrete opaque cells with a visible grid (one colour
-  // per 0.5° cell); SMOOTH = the vivid 5-class surface PNG (the paper look). So
-  // the surface overlay is shown ONLY in Smooth view; Cells view paints cells.
-  state.surfaceActive = haveSurface && state.view === 'smooth';
 
-  // Clear prior layers (and any open probe)
-  clearTimeout(probeHideTimer); hideProbe();
+  const haveSurface = !!(surface && surface.image && surface.bounds);
+  const haveCells = !!(data && data.features && data.features.length);
+
+  // View design: CELLS = discrete opaque cells with a visible grid (one colour
+  // per coarse cell); SMOOTH = the surface raster. A native high-resolution
+  // source has no cell geometry at all, so the raster is the only layer and
+  // Smooth is forced (applyViewConstraints keeps the control honest about it).
+  if (!haveCells && haveSurface) state.view = 'smooth';
+  state.surfaceActive = haveSurface && state.view === 'smooth';
+  syncViewButtons();   // the forced view must show in the control, not just in state
+
+  state.legendMap = {};
+  displayLegend().forEach((l) => { state.legendMap[l.cls] = l.color; });
+
+  // Clear prior layers (and any open probe / in-flight point request)
+  clearTimeout(probeHideTimer); cancelPointProbe(); hideProbe();
   if (surfaceLayer)  { surfaceLayer.remove();  surfaceLayer = null; }
   if (cellLayer)     { cellLayer.remove();     cellLayer = null; }
   if (boundaryLayer) { boundaryLayer.remove(); boundaryLayer = null; }
 
-  // Smooth interpolated surface (continuous mode only) — added below the cells
-  // so the transparent cells stay the hover/probe layer on top.
+  // Surface raster — added below the cells so transparent cells stay the
+  // hover/probe layer on top when cell geometry exists.
   if (state.surfaceActive) {
     surfaceLayer = L.imageOverlay(surface.image, surface.bounds, {
       opacity: 1, interactive: false, className: 'r0-surface',
@@ -516,24 +1025,32 @@ function renderField(data, surface) {
   // surface is shown. NO per-feature tooltips and NO bringToFront. Instead, a
   // SINGLE shared probe (managed above) is updated on the layer's mousemove and
   // removed on mouseout — one element, always replaced, so it cannot accumulate.
-  cellLayer = L.geoJSON(data, { style: styleCell }).addTo(map);
-  cellLayer.on('mousemove', (e) => {
-    const lyr = e.layer || e.propagatedFrom;
-    const p = lyr && lyr.feature && lyr.feature.properties;
-    if (!p) return;
-    clearTimeout(probeHideTimer);
-    showProbe(e.latlng, cellTooltip(p));
-  });
-  // Delay the hide so crossing from one cell to the next (mouseout→mousemove)
-  // doesn't flicker; a real exit has no following mousemove, so it hides.
-  cellLayer.on('mouseout', () => {
-    clearTimeout(probeHideTimer);
-    probeHideTimer = setTimeout(hideProbe, 60);
-  });
+  if (haveCells) {
+    cellLayer = L.geoJSON(data, { style: styleCell }).addTo(map);
+    cellLayer.on('mousemove', (e) => {
+      const lyr = e.layer || e.propagatedFrom;
+      const p = lyr && lyr.feature && lyr.feature.properties;
+      if (!p) return;
+      clearTimeout(probeHideTimer);
+      showProbe(e.latlng, cellTooltip(p));
+    });
+    // Delay the hide so crossing from one cell to the next (mouseout→mousemove)
+    // doesn't flicker; a real exit has no following mousemove, so it hides.
+    cellLayer.on('mouseout', () => {
+      clearTimeout(probeHideTimer);
+      probeHideTimer = setTimeout(hideProbe, 60);
+    });
+  }
 
-  // Boundary outline — crisp dark stroke that defines the figure
-  if (data.boundary) {
-    boundaryLayer = L.geoJSON(data.boundary, {
+  // Raster with no cell geometry → the hover value comes from /api/r0_point.
+  // Exactly one of the two probes is ever live.
+  setPointProbe(!haveCells && state.surfaceActive);
+
+  // Boundary outline — crisp dark stroke that defines the figure. A raster-only
+  // response may carry it too; if neither does, the masked raster edge stands in.
+  const boundary = (data && data.boundary) || (surface && surface.boundary) || null;
+  if (boundary) {
+    boundaryLayer = L.geoJSON(boundary, {
       interactive: false,
       style: { color: '#1b2733', weight: 1.4, opacity: 0.92, fill: false, lineJoin: 'round' },
     }).addTo(map);
@@ -543,8 +1060,9 @@ function renderField(data, surface) {
   // size, and re-fit on the next frame once layout has settled (guards against
   // the panel/window having resized since map init, which otherwise leaves the
   // image overlay and the vector boundary on mismatched pixel origins).
-  if (data.bbox) {
-    const [w, s, e, n] = data.bbox;
+  const bbox = fieldBbox();
+  if (bbox) {
+    const [w, s, e, n] = bbox;
     const fit = () => {
       map.invalidateSize({ animate: false });
       map.fitBounds([[s, w], [n, e]], { padding: [28, 28], animate: false });
@@ -553,10 +1071,13 @@ function renderField(data, surface) {
     requestAnimationFrame(fit);
   }
 
-  renderLegend(data);
-  renderMeta(data.meta);
-  renderCaveats(data.meta);
-  updateContext(data.meta);
+  const meta = displayMeta();
+  renderLegend();
+  renderMeta(meta);
+  renderCaveats(meta);
+  updateContext(meta);
+  applyViewConstraints();
+  applyScaleConstraints();
 
   // Keep place-labels overlay on top of freshly added layers (and un-freeze fade)
   refreshLabels();
@@ -578,7 +1099,12 @@ function updateContext(meta) {
   set('#ctxRegionV', region);
   set('#ctxModeV', modeLabel);
   set('#ctxTimeV', timeStr);
-  set('#sourceLine', meta && meta.source ? `Source — ${meta.source}` : 'Source — awaiting field');
+
+  // Provenance line: the source that actually produced this map, its NATIVE
+  // resolution and how it is being drawn. Never the source that was requested.
+  set('#sourceLine', meta && meta.source
+    ? `Source — ${provenanceText(meta)}`
+    : 'Source — awaiting field');
 
   // Legend caption
   set('#legendTime', (year != null ? `${MONTHS_SHORT[(meta && meta.month ? meta.month : state.month) - 1]} ${year}`
@@ -589,24 +1115,63 @@ function updateContext(meta) {
 /* =====================================================================
    Legend, metadata, caveats
    ===================================================================== */
-function renderLegend(data) {
+
+/* "CHELSA V2.1 · ~1 km · native raster" — source · native resolution · render.
+   `full` keeps the exact resolution string and the long render wording for the
+   metadata panel; the compact form is for the topbar and legend footer. */
+function provenanceText(meta, full) {
+  if (!meta) return '—';
+  const res = full ? meta.resolution : (shortRes(meta) || meta.resolution);
+  return [meta.source || '—', res, renderLabel(meta, full)]
+    .filter(Boolean).join(' · ');
+}
+
+/* Plain-language render mode. `native-1km` means pixels as delivered — no
+   interpolation — which is a materially different claim from the cosmetic
+   upsample the coarse source uses, so the two must never read alike. */
+function renderLabel(meta, full) {
+  if (!meta) return '';
+  const r = String(meta.render || '').toLowerCase();
+  if (!r) return state.surfaceActive ? 'raster' : 'cells';
+  // The resolution is stated alongside this label, so it is not repeated here.
+  // Three genuinely different claims, kept lexically distinct:
+  //   native    — source pixels, every one of them
+  //   resampled — still real source pixels, read at a coarser step (big regions)
+  //   interpolated — a cosmetic upsample of a much coarser grid (coarse source)
+  // Checked before "native" because "resampled-from-1km" also names the source.
+  if (r.includes('resampl')) {
+    return full ? 'resampled from 1 km (real source pixels, coarser step)' : 'resampled raster';
+  }
+  if (r.includes('native')) return full ? 'native raster (no interpolation)' : 'native raster';
+  if (r.includes('interpolat')) return full ? 'interpolated raster (cosmetic, not added resolution)' : 'interpolated raster';
+  return r;
+}
+
+function renderLegend() {
   const box = $('#legendBox');
   const list = $('#legendList');
   const cont = $('#legendContinuous');
   const note = $('#legendNote');
+  const tag = $('#legendScaleTag');
+  const prov = $('#legendProv');
   box.hidden = false;
   list.innerHTML = '';
 
-  const hasNull = data.features.some((f) => f.properties.cls == null);
+  const legend = displayLegend();
+  const relative = displayScale() === 'relative';
+  const f = state.field;
+  const hasNull = !!(f && f.features && f.features.some((x) => x.properties.cls == null));
 
-  // Classified swatches, read straight from the response legend.
-  (data.legend || []).forEach((l) => {
-    const isThr = l.cls === 'eq1';
+  // Swatches are read straight from the response legend — in relative mode the
+  // backend returns this map's ACTUAL numeric breaks, and those are what the
+  // reader sees. The renderer never invents or reuses class labels.
+  legend.forEach((l) => {
+    const isThr = !relative && l.cls === 'eq1';
     const li = document.createElement('li');
     li.className = 'map-legend__row' + (isThr ? ' is-threshold' : '');
     li.innerHTML =
-      `<span class="map-legend__swatch" style="background:${l.color}"></span>` +
-      `<span class="map-legend__rowlabel">R<sub>0</sub> ${l.label}</span>`;
+      `<span class="map-legend__swatch" style="background:${esc(l.color)}"></span>` +
+      `<span class="map-legend__rowlabel">R<sub>0</sub> ${esc(l.label)}</span>`;
     list.appendChild(li);
   });
   if (hasNull) {
@@ -618,28 +1183,76 @@ function renderLegend(data) {
     list.appendChild(li);
   }
 
-  // Both views (Cells + Smooth) share the same 5-class classified legend.
   if (cont) cont.hidden = true;
   list.style.display = '';
-  if (note) note.hidden = false;
+
+  // Relative mode must be unmistakable: a badge on the title AND a note saying
+  // the breaks are this map's own range, so nobody reads them as absolute
+  // suitability or looks for a threshold that is not in the scale.
+  if (tag) tag.hidden = !relative;
+  if (note) {
+    note.hidden = false;
+    note.classList.toggle('is-relative', relative);
+    note.innerHTML = relative
+      ? 'Relative stretch — breaks span THIS map only; not comparable between maps.'
+      : 'R<sub>0</sub> = 1 — suitability threshold';
+  }
+
+  // Figure-style provenance under the legend, so an exported screenshot of the
+  // map still carries the source it came from.
+  const meta = displayMeta();
+  if (prov) {
+    prov.textContent = meta ? provenanceText(meta) : '';
+    prov.hidden = !meta;
+  }
 }
 
+/* Field metadata — the panel a user checks before trusting the map, so it
+   carries full provenance: which source, at what native resolution, drawn how,
+   on which colour scale, over how many cells or pixels. */
 function renderMeta(meta) {
   if (!meta) return;
   const box = $('#metaBox');
   const grid = $('#metaGrid');
   box.hidden = false;
+
+  // meta.grid is [nx, ny] (width × height); meta.shape is [rows, cols], so it
+  // has to be flipped to read as width × height.
+  const g = Array.isArray(meta.grid) && meta.grid.length === 2 ? meta.grid
+    : (Array.isArray(meta.shape) && meta.shape.length === 2 ? [meta.shape[1], meta.shape[0]] : null);
+  const gridSize = g
+    ? `${Number(g[0]).toLocaleString()} × ${Number(g[1]).toLocaleString()}`
+    : null;
+  const relative = displayScale() === 'relative';
+
   const rows = [
     ['Mode', meta.mode === 'month' ? 'Historical' : 'Climatology'],
     ['Month', MONTHS[(meta.month || 1) - 1]],
     ['Year', meta.year != null ? meta.year : '—'],
-    ['Resolution', meta.resolution || '—'],
-    ['Cells', meta.n_cells != null ? meta.n_cells.toLocaleString() : '—'],
     ['Source', meta.source || '—'],
+    ['Native resolution', meta.resolution || '—'],
+    ['Render', renderLabel(meta, true) || '—'],
+    ['Colour scale', relative ? 'Relative (this map)' : 'Absolute (fixed classes)'],
   ];
+  if (gridSize && state.surfaceActive) {
+    rows.push(['Grid', `${gridSize} px`]);
+    if (meta.n_valid_px != null) rows.push(['Valid pixels', meta.n_valid_px.toLocaleString()]);
+  } else {
+    rows.push(['Cells', meta.n_cells != null ? meta.n_cells.toLocaleString() : '—']);
+  }
+
   grid.innerHTML = rows
-    .map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`)
+    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`)
     .join('');
+
+  // meta.note explains a rendering compromise the numbers above cannot show —
+  // e.g. why a large region was read at a coarser step. It is absent when there
+  // is nothing to say, which is not an error.
+  const noteEl = $('#metaNote');
+  if (noteEl) {
+    noteEl.textContent = meta.note || '';
+    noteEl.hidden = !meta.note;
+  }
 }
 
 function renderCaveats(meta) {
@@ -673,48 +1286,151 @@ async function loadOccurrences() {
 /* =====================================================================
    Loader
    ===================================================================== */
-function showLoader(msg, isError) {
+let elapsedTimer = null;
+
+/* A first high-resolution read costs ~15-60 s. That has to read as intentional
+   work with visible progress, not as a hang: the loader names what is being
+   read, says it will be cached, and counts elapsed seconds. */
+function showLoader(msg, sub, isError) {
   $('#loaderText').textContent = msg || 'Computing suitability field…';
+  const subEl = $('#loaderSub');
+  if (subEl) { subEl.textContent = sub || ''; subEl.hidden = !sub; }
+
   const el = $('#loader');
   el.classList.toggle('is-error', !!isError);
   el.hidden = false;
+
+  const elEl = $('#loaderElapsed');
+  clearInterval(elapsedTimer); elapsedTimer = null;
+  if (isError) { if (elEl) elEl.hidden = true; return; }
+  if (elEl) {
+    let t = 0;
+    elEl.textContent = '0 s';
+    elEl.hidden = false;
+    elapsedTimer = setInterval(() => { t += 1; elEl.textContent = `${t} s`; }, 1000);
+  }
 }
-function hideLoader() { const el = $('#loader'); el.hidden = true; el.classList.remove('is-error'); }
+
+function hideLoader() {
+  clearInterval(elapsedTimer); elapsedTimer = null;
+  const el = $('#loader');
+  el.hidden = true;
+  el.classList.remove('is-error');
+  const elEl = $('#loaderElapsed'); if (elEl) elEl.hidden = true;
+}
+
+/* Lock the whole control panel while a field computes — during a long read the
+   controls must not look like somewhere clicking again would help. */
+function setBusy(on) {
+  const panel = $('#panel');
+  if (panel) { panel.classList.toggle('is-busy', !!on); panel.setAttribute('aria-busy', on ? 'true' : 'false'); }
+  const btn = $('#computeBtn'); if (btn) btn.disabled = !!on;
+  const wbtn = $('#welcomeCompute'); if (wbtn) wbtn.disabled = !!on;
+}
 
 /* =====================================================================
    Compute (fetch /api/r0)
    ===================================================================== */
 let computing = false;
+
+/* The parameter set for the current query, including the resolved source. */
+function computeParams(sourceId) {
+  return {
+    mode: state.mode, month: state.month, year: state.year, ramp: 'bins',
+    source: sourceId, scale: state.scale,
+  };
+}
+
+/* One attempt at one source. A native high-resolution source has no per-cell
+   GeoJSON, so only the raster is requested and the hover value comes from
+   /api/r0_point. The coarse source fetches BOTH: cells are authoritative for
+   the Cells view and the hover hit-test, the raster is the Smooth view. */
+async function runQuery(sourceId) {
+  const params = computeParams(sourceId);
+  const native = sourceId === 'chelsa';
+  const [data, surface] = await Promise.all([
+    native ? Promise.resolve(null) : api.r0(state.region, params),
+    fetchSurface(state.region, params, native),
+  ]);
+  if (!data && !surface) throw new Error('no field returned');
+  return [data, surface];
+}
+
+/* The high-resolution source refused this specific query. Relay the server's
+   own reason — it is more precise than anything the client could infer. */
+function noteRefusal(detail) {
+  const el = $('#srcNote');
+  if (!el) return;
+  const meta = displayMeta();
+  const got = (meta && meta.source) || sourceName('power');
+  el.innerHTML = `${esc(detail)} — this map uses <strong>${esc(got)}</strong>.`;
+  el.classList.add('note--warn');
+  el.hidden = false;
+}
+
 async function compute() {
   if (computing || !state.region) return;
   computing = true;
-  const btn = $('#computeBtn');
-  btn.disabled = true;
-  showLoader(`Computing ${state.region.name} · ${MONTHS_SHORT[state.month - 1]}…`);
+  setBusy(true);
+
+  // Settle the coverage verdict before choosing a source: it is instant, and it
+  // means the request goes to whichever source the backend itself would pick.
+  clearTimeout(coverageTimer);
+  await refreshCoverage().catch(() => {});
+
+  const resolved = resolveSource();
+  state.requestedSource = resolved.id;
+  const native = resolved.id === 'chelsa';
+  const where = `${state.region.name} · ${MONTHS_SHORT[state.month - 1]}`;
+
+  showLoader(
+    native ? `Reading ${sourceName(resolved.id)} rasters — ${where}` : `Computing ${where}…`,
+    native
+      ? 'First run for this region and month; the result is cached afterwards.'
+      : '');
+
   try {
-    const params = { mode: state.mode, month: state.month, year: state.year, ramp: 'bins' };
-    // Cells (authoritative for hover/query + legend) plus the smooth 5-class
-    // surface (the vivid BINS PNG) are fetched concurrently. Cells view paints
-    // discrete cells; Smooth view shows the surface — both share the 5 classes.
-    const [data, surface] = await Promise.all([
-      api.r0(state.region, params),
-      fetchSurface(state.region, params),
-    ]);
+    let data, surface, refusal = null;
+    try {
+      [data, surface] = await runQuery(resolved.id);
+    } catch (err) {
+      // The capability list cannot describe every gap (e.g. a partial final
+      // year). If the high-resolution source refuses this exact query, fall
+      // back to the coarse one and say why — never fail the map outright.
+      if (resolved.id === 'chelsa' && isRefusal(err)) {
+        console.info('[R0] high-resolution source refused this query:', err.detail || err.message);
+        refusal = err.detail || err.message;
+        state.requestedSource = 'power';
+        showLoader(`Computing ${where}…`, `Falling back to ${sourceName('power')}.`);
+        [data, surface] = await runQuery('power');
+      } else {
+        throw err;
+      }
+    }
+
     renderField(data, surface);
+    reconcileProvenance(displayMeta());
+    if (refusal) noteRefusal(refusal);
     state.hasResult = true;
     state.dirty = false;
     const welcome = $('#welcome'); if (welcome) welcome.hidden = true;  // dismiss first-run state
     updateRunButton();
   } catch (err) {
     console.error('[R0] compute failed:', err);
-    showLoader('Could not compute the field — check the backend connection, then retry.', true);
-    setTimeout(hideLoader, 2600);
-    computing = false; btn.disabled = false;
+    const timedOut = err && (err.name === 'AbortError' || /timeout/i.test(err.message || ''));
+    showLoader(
+      timedOut
+        ? 'The field is taking longer than expected.'
+        : 'Could not compute the field — check the backend connection, then retry.',
+      timedOut ? 'The server may still be reading the rasters. Retry in a moment.' : '',
+      true);
+    setTimeout(hideLoader, 3200);
+    computing = false; setBusy(false);
     return;
   }
   hideLoader();
   computing = false;
-  btn.disabled = false;
+  setBusy(false);
 }
 
 /* =====================================================================
@@ -726,9 +1442,37 @@ function queryTimeLabel() {
     : MONTHS_SHORT[state.month - 1];
 }
 
+/* Widest year span across the available sources — the input stays open across
+   all of them so a fallback is explained, not prevented. */
+function yearSpan() {
+  const now = new Date().getFullYear();
+  // year_max === null means "up to the present" (a live source), NOT "unknown" —
+  // dropping those would wrongly clamp the input to the archive source's end.
+  const mins = state.sources.map((s) => (s.year_min == null ? 1979 : s.year_min));
+  const maxs = state.sources.map((s) => (s.year_max == null ? now : s.year_max));
+  return [mins.length ? Math.min(...mins) : 1979, maxs.length ? Math.max(...maxs) : now];
+}
+
+/* Compact coverage string for the year hint, e.g.
+   "CHELSA V2.1 1979–2018 (+2019 01–04) · NASA POWER 1981–now".
+   The complete-years span and the partial-year months are stated separately so
+   the hint cannot imply a whole year that is only part-published. */
+function coverageLabel(s) {
+  const lo = s.year_min == null ? 1979 : s.year_min;
+  const end = s.year_max == null ? 'now'
+    : (s.year_max_complete != null ? s.year_max_complete : s.year_max);
+  const pad = (n) => String(n).padStart(2, '0');
+  const partial = Object.entries(s.partial_years || {})
+    .map(([y, r]) => `${y} ${pad(r.month_min)}–${pad(r.month_max)}`);
+  return `${s.label} ${lo}–${end}${partial.length ? ` (+${partial.join(', ')})` : ''}`;
+}
+
 function updateComputeMeta() {
   const region = state.region ? state.region.name : 'a region';
   const time = queryTimeLabel();
+  // The button meta describes the PENDING query. Resolution is deliberately NOT
+  // repeated here — the source note directly above already states it, and the
+  // extra clause only wraps the button label.
   const meta = $('#computeMeta'); if (meta) meta.textContent = `${region} · ${time}`;
   const wl = $('#welcomeBtnLabel'); if (wl) wl.textContent = `Compute ${region} · ${time}`;
   updateRunButton();
@@ -763,22 +1507,41 @@ function setMode(mode) {
   const historical = mode === 'month';
   yearField.classList.toggle('is-disabled', !historical);
   yearInput.disabled = !historical;
-  $('#yearHint').textContent = historical ? `1981 – 2025` : 'climatology — disabled';
+  $('#yearHint').textContent = historical ? '' : 'climatology — disabled';
+  queryChanged();
+}
+
+/* One place for "the pending query changed": refresh the labels, re-ask the
+   backend which source will serve it, and mark the shown result stale. Called
+   by every query-param mutator so the coverage check can never be forgotten
+   for one of them (month in particular — coverage is month-precise). */
+function queryChanged() {
   updateComputeMeta();
+  updateSourceNote();
+  scheduleCoverage();
   markDirty();
 }
 
-function setView(view) {
-  state.view = view;
+function syncViewButtons() {
   $$('#viewToggle .segmented__opt').forEach((b) => {
-    const on = b.dataset.view === view;
+    const on = b.dataset.view === state.view;
     b.classList.toggle('is-active', on);
     b.setAttribute('aria-checked', on ? 'true' : 'false');
   });
-  if (!cellLayer) return;  // nothing rendered yet
+}
 
-  // SMOOTH shows the vivid 5-class surface (cached at compute) over transparent
-  // cells; CELLS removes the surface and paints discrete cells with a grid.
+function setView(view) {
+  // A raster-only result (native high-resolution source) has no cell geometry —
+  // Cells is not a view it can offer, and pretending otherwise would show a
+  // coarse grid while the panel claims 1 km data.
+  if (view === 'cells' && !cellLayer && !!state.surface) return;
+
+  state.view = view;
+  syncViewButtons();
+  if (!cellLayer && !state.surface) return;  // nothing rendered yet
+
+  // SMOOTH shows the surface raster (cached at compute) over transparent cells;
+  // CELLS removes the surface and paints discrete cells with a grid.
   const s = state.surface;
   const haveSurface = !!(s && s.image && s.bounds);
   state.surfaceActive = haveSurface && view === 'smooth';
@@ -789,15 +1552,137 @@ function setView(view) {
       surfaceLayer = L.imageOverlay(s.image, s.bounds, {
         opacity: 1, interactive: false, className: 'r0-surface',
       }).addTo(map);
-      cellLayer.bringToFront();           // keep transparent cells on top for hover
+      if (cellLayer) cellLayer.bringToFront();   // keep transparent cells on top for hover
     }
   } else if (surfaceLayer) {
     surfaceLayer.remove(); surfaceLayer = null;  // cells view → discrete painted cells
   }
   refreshLabels();
 
-  cellLayer.setStyle(styleCell);          // transparent when surface active, else painted + grid
-  renderLegend(state.field);
+  // Exactly one probe is live: cell hit-test when cells exist, else point probe.
+  setPointProbe(!cellLayer && state.surfaceActive);
+
+  if (cellLayer) cellLayer.setStyle(styleCell);  // transparent when surface active, else painted + grid
+  state.legendMap = {};
+  displayLegend().forEach((l) => { state.legendMap[l.cls] = l.color; });
+  renderLegend();
+  renderMeta(displayMeta());
+  updateContext(displayMeta());
+  applyScaleConstraints();
+}
+
+/* The Cells option is only real when cell geometry came back. Disable it (with
+   a reason) rather than leaving a control that silently does nothing. */
+function applyViewConstraints() {
+  const btn = $('#viewToggle .segmented__opt[data-view="cells"]');
+  const note = $('#viewNote');
+  // Keyed off the layers that actually exist, NOT state.hasResult — the first
+  // render calls this before hasResult is set, and the control has to be
+  // correct on that very first paint.
+  const rasterOnly = !cellLayer && !!state.surface;
+  if (btn) {
+    btn.disabled = rasterOnly;
+    btn.setAttribute('aria-disabled', rasterOnly ? 'true' : 'false');
+  }
+  if (note) {
+    const meta = displayMeta();
+    note.textContent = rasterOnly
+      ? `${(meta && meta.source) || 'This source'} is drawn as a ${(meta && meta.resolution) || 'native'} raster — there is no coarse cell grid to show.`
+      : '';
+    note.hidden = !rasterOnly;
+  }
+}
+
+/* Colour scale is a property of the RASTER render, so it only applies while the
+   raster is the visible layer. In Cells view the classes are fixed. */
+function applyScaleConstraints() {
+  const rel = $('#scaleToggle .segmented__opt[data-scale="relative"]');
+  const note = $('#scaleNote');
+  const canStretch = !state.surface || state.surfaceActive;
+  if (rel) {
+    rel.disabled = !canStretch;
+    rel.setAttribute('aria-disabled', canStretch ? 'false' : 'true');
+  }
+  if (!note) return;
+
+  if (!canStretch) {
+    note.textContent = 'Cells always use the fixed classes; switch to Smooth to stretch the scale.';
+    note.classList.remove('note--warn');
+    note.hidden = false;
+  } else if (state.scale === 'relative' && state.hasResult && displayScale() !== 'relative') {
+    // Asked for the stretch, got the fixed classes — say so instead of leaving
+    // a "Relative" control lit over an absolute map.
+    note.textContent = 'This server rendered the fixed classes — the relative stretch was not applied.';
+    note.classList.add('note--warn');
+    note.hidden = false;
+  } else if (displayScale() === 'relative') {
+    note.textContent = 'Breaks are stretched to this map only — for visual comparison, not for reading absolute suitability.';
+    note.classList.remove('note--warn');
+    note.hidden = false;
+  } else {
+    note.textContent = 'Fixed 5 classes including the R0 = 1 threshold — comparable between maps.';
+    note.classList.remove('note--warn');
+    note.hidden = false;
+  }
+}
+
+/* Colour scale is a DISPLAY option: it re-renders the raster (the climate read
+   is already cached server-side) instead of marking the result stale. */
+function syncScaleButtons() {
+  $$('#scaleToggle .segmented__opt').forEach((b) => {
+    const on = b.dataset.scale === state.scale;
+    b.classList.toggle('is-active', on);
+    b.setAttribute('aria-checked', on ? 'true' : 'false');
+  });
+}
+
+async function setScale(scale) {
+  const prev = state.scale;
+  state.scale = scale;
+  syncScaleButtons();
+  if (!state.hasResult || !state.region || computing) { applyScaleConstraints(); return; }
+
+  computing = true;
+  setBusy(true);
+  showLoader(scale === 'relative'
+    ? 'Re-rendering with a per-map stretch…'
+    : 'Re-rendering the fixed classes…', '');
+  try {
+    const params = computeParams(state.servedSource || state.requestedSource);
+    const surface = await fetchSurface(state.region, params);
+    if (surface) swapSurface(surface);
+    else console.warn('[R0] scale change: no surface returned, keeping previous render');
+  } catch (err) {
+    console.warn('[R0] scale change failed:', err.message);
+    state.scale = prev;
+    syncScaleButtons();
+  }
+  hideLoader();
+  computing = false;
+  setBusy(false);
+  applyScaleConstraints();
+}
+
+/* Replace the raster in place — same extent, new colouring. Deliberately does
+   NOT re-fit the map: a colour-scale change must not throw away the user's pan
+   and zoom. Legend + metadata follow the new response's breaks. */
+function swapSurface(surface) {
+  state.surface = surface;
+  if (surfaceLayer) { surfaceLayer.remove(); surfaceLayer = null; }
+  if (state.surfaceActive) {
+    surfaceLayer = L.imageOverlay(surface.image, surface.bounds, {
+      opacity: 1, interactive: false, className: 'r0-surface',
+    }).addTo(map);
+    if (cellLayer) cellLayer.bringToFront();
+  }
+  state.legendMap = {};
+  displayLegend().forEach((l) => { state.legendMap[l.cls] = l.color; });
+  if (cellLayer) cellLayer.setStyle(styleCell);
+  refreshLabels();
+  const meta = displayMeta();
+  renderLegend();
+  renderMeta(meta);
+  updateContext(meta);
 }
 
 function setMonth(m) {
@@ -807,8 +1692,7 @@ function setMonth(m) {
   range.value = m;                       // keep the thumb in sync (e.g. on init defaults)
   const pct = ((m - 1) / 11) * 100;
   range.style.setProperty('--p', `${pct}%`);
-  updateComputeMeta();
-  markDirty();
+  queryChanged();   // coverage is month-precise, so the month matters here
 }
 
 function wireControls() {
@@ -825,25 +1709,39 @@ function wireControls() {
   const labelsBtn = $('#labelsToggle');
   if (labelsBtn) labelsBtn.addEventListener('click', () => setLabels(!state.labelsOn));
 
+  // Climate source — a QUERY param: it stages the change and marks stale.
+  const srcSel = $('#sourceSelect');
+  if (srcSel) srcSel.addEventListener('change', () => {
+    state.source = srcSel.value;
+    queryChanged();
+  });
+
   // Mode
   $$('#modeToggle .segmented__opt').forEach((b) =>
     b.addEventListener('click', () => setMode(b.dataset.mode)));
 
   // View (Cells / Smooth)
   $$('#viewToggle .segmented__opt').forEach((b) =>
-    b.addEventListener('click', () => setView(b.dataset.view)));
+    b.addEventListener('click', () => { if (!b.disabled) setView(b.dataset.view); }));
+
+  // Colour scale (Absolute / Relative) — a DISPLAY option: re-renders the
+  // raster from the cached climate read, never marks the result stale.
+  $$('#scaleToggle .segmented__opt').forEach((b) =>
+    b.addEventListener('click', () => { if (!b.disabled) setScale(b.dataset.scale); }));
 
   // Month
   const range = $('#monthRange');
   range.addEventListener('input', () => setMonth(parseInt(range.value, 10)));
 
   // Year
+  // Year — clamped to the WIDEST span any available source offers, so a year
+  // that only one source covers stays selectable and the note explains the swap.
   const yearInput = $('#yearInput');
   yearInput.addEventListener('change', () => {
-    state.year = clamp(parseInt(yearInput.value, 10) || 2024, 1981, 2025);
+    const [lo, hi] = yearSpan();
+    state.year = clamp(parseInt(yearInput.value, 10) || state.year, lo, hi);
     yearInput.value = state.year;
-    updateComputeMeta();
-    markDirty();
+    queryChanged();
   });
 
   // Occurrences (a DISPLAY option — applies to the current result, no recompute)
@@ -874,6 +1772,7 @@ function wireControls() {
    Bootstrap
    ===================================================================== */
 async function init() {
+  await loadBasemapConfig();   // must precede initMap — see loadBasemapConfig
   initMap();
   wireControls();
 
@@ -884,29 +1783,55 @@ async function init() {
   setMonth(7);                 // a representative default month (not computed yet)
   setMode('climatology');
   setView('cells');
+  setScale('absolute');
   setLabels(true);             // place-labels ON by default (toggle to hide)
 
   // Open on the locust belt — an inviting overview, NOT a precomputed country.
   map.fitBounds([[-6, -18], [33, 56]], { padding: [20, 20], animate: false });
 
-  // Populate regions
-  try {
-    const res = await api.regions();
-    state.regions = res.presets || [];
-  } catch (err) {
-    console.error('[R0] could not load regions:', err.message);
-    state.regions = MOCK_REGIONS;
-  }
+  // Regions + climate-source capabilities, in parallel.
+  const [regionsRes, sourcesRes] = await Promise.all([
+    api.regions().catch((err) => {
+      console.error('[R0] could not load regions:', err.message);
+      return null;
+    }),
+    api.sources().catch((err) => {
+      // Not an error state: a server without /api/sources simply offers the
+      // coarse source, and the control says so rather than inventing options.
+      console.info('[R0] /api/sources unavailable — coarse source only:', err.message);
+      return null;
+    }),
+  ]);
+
+  state.regions = (regionsRes && regionsRes.presets) || MOCK_REGIONS;
+
+  const caps = Array.isArray(sourcesRes) ? sourcesRes
+    : (sourcesRes && Array.isArray(sourcesRes.sources) ? sourcesRes.sources : null);
+  state.sourcesLive = !!(caps && caps.length);
+  state.sources = state.sourcesLive ? caps : CONFIG.sourcesFallback.slice();
+  renderSourceOptions();
+
   const sel = $('#regionSelect');
   sel.innerHTML = state.regions
-    .map((r) => `<option value="${r.code}">${r.name}</option>`)
+    .map((r) => `<option value="${esc(r.code)}">${esc(r.name)}</option>`)
     .join('');
   // Pre-select a representative region (NOT computed) so the first run is one click.
   state.region = state.regions.find((r) => r.code === 'KEN') || state.regions[0];
   if (state.region) sel.value = state.region.code;
 
+  // Year input spans every source on offer; the note explains any substitution.
+  const [ylo, yhi] = yearSpan();
+  const yi = $('#yearInput');
+  if (yi) {
+    yi.min = ylo; yi.max = yhi;
+    state.year = clamp(state.year, ylo, yhi);
+    yi.value = state.year;
+  }
+
   renderCaveats(null);         // seed About copy before first compute
+  updateSourceNote();          // source note + year hint + welcome hint
   updateComputeMeta();         // populate the Compute / welcome button labels
+  scheduleCoverage();          // ask which source serves the pre-selected query
 
   // No auto-compute: the user runs the field from the welcome card or the panel CTA.
 }

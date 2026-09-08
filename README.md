@@ -64,6 +64,29 @@ python3.12 -m venv .venv
 ./.venv/bin/uvicorn backend.api:app --reload
 ```
 
+### Configuration
+
+One optional environment variable, `CARTO_API_KEY` — a CARTO Basemaps key that
+removes the "API KEY REQUIRED" watermark from the basemap tiles.
+
+```bash
+cp .env.example .env      # .env is gitignored — never commit a real key
+$EDITOR .env              # CARTO_API_KEY=<your key>
+```
+
+Leaving it unset is safe: the map still works, just watermarked. The key is
+read per request (so it can be rotated without a restart), a real environment
+variable takes precedence over `.env`, and it is served to the page by
+`GET /api/config`. That last part is by design — the browser fetches tiles
+directly from CARTO, so the credential is client-side and cannot be hidden;
+scope and rotate it at the provider rather than trying to conceal it.
+`.env` and `.env.*` are excluded from both git and the Docker build context.
+
+> **Attribution is a licence condition.** CARTO's free tier (5,000,000 tile
+> requests/month) requires the CARTO **and** OpenStreetMap attribution to
+> remain visible on the map. The attribution line in `frontend/app.js`
+> satisfies this — do not remove it.
+
 ## Deploy to a server
 
 For VPS deployment (Docker Compose or bare-metal systemd, with an Nginx
@@ -90,41 +113,147 @@ denominator `(1-omega)*(1-epsilon) <= 1e-3`). `classify_r0` bins a value into
 | Method | Path | Notes |
 | ------ | ---- | ----- |
 | GET | `/api/regions` | `{ "presets": [{code, name}, ...] }` |
-| GET | `/api/r0` | params: `region`, `level` (0), `mode` (`climatology`\|`month`), `month` (1–12), `year` (for `month`), `ramp` (`bins`\|`continuous`) |
-| GET | `/api/r0_surface` | same params as `/api/r0`; returns a smooth, country-clipped R0 surface PNG |
+| GET | `/api/config` | `{ "basemap": {"key": <str\|null>, "provider": "carto"} }` — basemap credentials only |
+| GET | `/api/sources` | climate-source capabilities for the source picker |
+| GET | `/api/coverage` | `mode`, `month`, `year`, `source` — which source a slice would use, without rendering it |
+| GET | `/api/r0` | params: `region`, `level` (0), `mode` (`climatology`\|`month`), `month` (1–12), `year` (for `month`), `ramp` (`bins`\|`continuous`), `source` (default `power`) |
+| GET | `/api/r0_surface` | same params plus `source` (`chelsa`\|`power`\|`auto`, default `auto`) and `scale` (`absolute`\|`relative`, default `absolute`) |
+| GET | `/api/r0_point` | `lat`, `lon`, `region`, `level`, `mode`, `month`, `year`, `source` — one sampled pixel |
 | GET | `/api/occurrences?region=CODE` | GeoJSON points from `data/occurrences/<CODE>.csv` |
 | POST | `/api/occurrences` | multipart CSV upload (`file`); optional `?region=CODE` persists it |
 
 `/api/r0` returns a `FeatureCollection` of one Polygon per native cell
 (0.5° lat × 0.625° lon) with properties `{r0, t, rh, cls}`, plus `boundary`,
 `legend`, `bbox`, and a `meta` block (mode, month, year, source, resolution,
-n_cells, caveats). The frontend uses it for hover / cell query.
+n_cells, caveats). This view is NASA POWER only — `source=chelsa` returns 400,
+because a ~1 km field is millions of pixels; use `/api/r0_surface` for the
+raster and `/api/r0_point` to probe it.
 
-`/api/r0_surface` returns a paper-style smooth choropleth as a base64 PNG:
-`{ image, bounds: [[s,w],[n,e]], legend, bbox: [w,s,e,n], meta }`. The native
-0.5° R0 field is interpolated (scipy `griddata`, cubic → linear → nearest) onto
-a ~0.05° grid, clipped to the country polygon (transparent outside), and
-coloured by class (`ramp=bins`) or a continuous diverging blue→cream→red ramp
-centred on the R0 = 1 threshold over R0 ∈ [0.8, 1.1] (`ramp=continuous`,
-matching the frontend legend). The image is sized for Leaflet `imageOverlay`
-with `bounds`. `meta.render = "interpolated-surface"` and `meta.note` flag that
-this is **cosmetic smoothing of coarse data, not added resolution** (true ~1 km
-is the GEE phase-2).
+`/api/r0_surface` returns a country-clipped choropleth as a base64 PNG:
+`{ image, bounds: [[s,w],[n,e]], boundary, legend, bbox: [w,s,e,n], meta }`,
+sized for a Leaflet `imageOverlay`. `boundary` is the same GeoJSON geometry
+`/api/r0` returns for that region and level, on **both** source paths, so the
+response is self-contained: a client can draw the country outline without a
+second call, and the outline is identical in the cells and surface views.
+Two render paths, chosen by `source`:
+
+* **CHELSA** — R0 is evaluated per source pixel, classified, masked to the
+  polygon and coloured. Nothing is interpolated. A region small enough to read
+  in full reports `meta.render = "native-1km"` and
+  `meta.resolution = "~1 km (30 arcsec)"`; a region too large for the pixel
+  budget is read at a coarser step and says so —
+  `meta.render = "resampled-from-1km"`,
+  `meta.resolution = "~1.1 km (resampled from 30 arcsec)"` (derived from the
+  actual step, so it scales), plus a `meta.note`. Either way `meta` carries
+  `shape` `[ny, nx]`, `resolution_deg`, `native_res_deg`, `decimated` and
+  `resampling_factor`. **A decimated map must never claim native resolution:**
+  those are still real source pixels, just sampled at a coarser step, and the
+  strings are what the UI shows the user. `/api/r0_point` reads the same raster
+  and reports the same resolution fields.
+* **NASA POWER (`meta.render = "interpolated-surface"`)** — unchanged: the
+  native 0.5° field is interpolated (scipy `griddata`, cubic → linear →
+  nearest) onto a ~0.05° grid. `meta.note` still flags that this is **cosmetic
+  smoothing of coarse data, not added resolution**.
+
+Both paths honour `ramp` (`bins` = the five suitability classes; `continuous` =
+a diverging blue→cream→red ramp centred on R0 = 1 over R0 ∈ [0.8, 1.1]) and
+report the source actually used in `meta.source` / `meta.source_id`.
+
+`scale` controls the class breaks and the legend:
+
+* `absolute` (default) — the fixed thresholds `< 0.8`, `0.8–1`, `= 1`, `1–1.1`,
+  `≥ 1.1`. Comparable across regions and months.
+* `relative` — quintiles of the finite R0 values **in this map only**. The
+  legend rows carry the real numeric ranges (e.g. `0.783 – 0.968`) with class
+  ids `q1…q5`, and `meta.breaks` lists the break points. Use it to see
+  structure in a field that clusters near R0 = 1; do not compare two relative
+  maps to each other. (It restyles the classified render; the continuous ramp
+  keeps its fixed domain.)
+
+`/api/r0_point` samples a single coordinate from the cached raster —
+`{ r0, t, rh, cls, meta }`, with `rh` in percent and all four null (HTTP 200,
+not an error) outside the data. It replaces per-cell GeoJSON for hover at 1 km.
 
 Example:
 
 ```bash
 curl 'http://127.0.0.1:8000/api/r0?region=KEN&mode=climatology&month=7'
+curl 'http://127.0.0.1:8000/api/r0_surface?region=KEN&mode=climatology&month=7&source=chelsa'
+curl 'http://127.0.0.1:8000/api/r0_point?lat=-0.15&lon=37.31&region=KEN&mode=climatology&month=7'
 ```
 
 ## Climate data
+
+Two sources. `source=auto` (the `/api/r0_surface` default) picks CHELSA
+wherever it has data and falls back to NASA POWER otherwise, reporting the
+choice — and the reason for any fallback — in `meta.source` /
+`meta.source_note`.
+
+### CHELSA V2.1 — primary, ~1 km
+
+Global 30-arcsec GeoTIFFs on a public object store, read directly over HTTP:
+
+* climatology `…/climatologies/{var}/1981-2010/CHELSA_{var}_{MM}_1981-2010_V.2.1.tif`
+* monthly     `…/monthly/{var}/{year}/CHELSA_{var}_{MM}_{year}_V.2.1.tif`
+* variables `tas` (temperature) and `hurs` (relative humidity), fetched
+  concurrently.
+
+The files are tiled (512×512), DEFLATE-compressed and carry 7 overview levels,
+so `rasterio` + `/vsicurl/` reads only the byte ranges for the requested
+window, and decimates on read (via `out_shape`) to keep the returned array
+under ~2.5 M pixels. Kenya fits at native 1 km; Mali and other large countries
+come back at ~1.1 km.
+
+**Unit conversions (from the band tags — do not simplify):**
+
+| var | stored | conversion |
+| --- | ------ | ---------- |
+| `tas` | K, scale 0.1 | `°C = raw * 0.1 - 273.15` |
+| `hurs` | percent, scale 0.01 | `fraction = raw * 0.01 / 100` |
+
+NoData is `65535` → NaN. A naive `tas * 0.01` yields a physically impossible
+flat 26–30 °C field; the correct conversion gives −9.75 °C (Mt Kenya) to
+31.05 °C for Kenya in July.
+
+**Coverage:** climatology always; monthly complete for 1979–2018, 2019 months
+01–04 only, 2020 onward absent. `ChelsaProvider.supports(mode, year, month)`
+encodes this, and the API falls back to NASA POWER (with a reason) rather than
+failing.
+
+Because the last year is **partial**, `/api/sources` reports coverage
+month-precisely — a picker built on `year_max` alone would offer 2019 months
+that do not exist:
+
+| field | chelsa | meaning |
+| --- | --- | --- |
+| `year_min` | 1979 | first year with any data |
+| `year_max` | 2019 | last year with **any** data |
+| `year_max_complete` | 2018 | last year with all 12 months |
+| `partial_years` | `{"2019": {"month_min": 1, "month_max": 4}}` | months available past `year_max_complete` |
+| `partial_note` | *"2019 is published for months 01–04 only…"* | display string |
+
+So the client's selectable months for a year are: the full range up to
+`year_max_complete`, the `partial_years` entry if listed, otherwise none.
+
+`GET /api/coverage?mode=&month=&year=&source=` answers the same question for one
+slice without rendering it — useful to warn *before* a multi-second render:
+`{mode, month, year, source_requested, chelsa_available, chelsa_reason,
+resolved_source, resolved_label, resolved_resolution, would_error, note}`.
+It applies exactly the rule `/api/r0_surface` will apply, so the two cannot
+drift.
+
+Results are cached as compressed `.npz` under `data/cache/chelsa/` plus a small
+in-process LRU, so a repeat request is near-instant.
+
+### NASA POWER — recent years and the per-cell view
 
 NASA POWER regional API, endpoints
 `temporal/{climatology|monthly}/regional`, parameters `T2M` (°C, used as-is)
 and `RH2M` (percent → fraction). The API allows one parameter per call, so the
 provider issues two calls and joins by `(lon, lat)`. Bounding boxes are tiled
 into ≤ 10° × 10° chunks, fetched with retries and a short inter-call delay, and
-cached on disk.
+cached on disk. Coarse (0.5° × 0.625°) but current, and the only source for
+`/api/r0`.
 
 ## Boundaries
 

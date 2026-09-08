@@ -17,7 +17,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Spectral:wght@400;500;600&display=swap" rel="stylesheet" />
 
-  <link rel="stylesheet" href="style.css?v=9" />
+  <link rel="stylesheet" href="style.css?v=15" />
 </head>
 <body>
   <div class="app" id="app">
@@ -65,9 +65,21 @@
             </div>
           </section>
 
+          <!-- Climate source (capabilities come from GET /api/sources) -->
+          <section class="field" id="sourceField" style="--i:2">
+            <label class="field__label" for="sourceSelect">
+              <span class="field__num">02</span> Climate source
+            </label>
+            <div class="select">
+              <select id="sourceSelect" aria-label="Climate source" aria-describedby="srcNote"></select>
+              <svg class="select__chev" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 4l4 4 4-4"/></svg>
+            </div>
+            <p class="note" id="srcNote" hidden></p>
+          </section>
+
           <!-- Mode toggle -->
-          <section class="field" style="--i:2">
-            <span class="field__label"><span class="field__num">02</span> Temporal basis</span>
+          <section class="field" style="--i:3">
+            <span class="field__label"><span class="field__num">03</span> Temporal basis</span>
             <div class="segmented" id="modeToggle" role="radiogroup" aria-label="Temporal basis">
               <button type="button" class="segmented__opt is-active" data-mode="climatology" role="radio" aria-checked="true">Climatology</button>
               <button type="button" class="segmented__opt" data-mode="month" role="radio" aria-checked="false">Historical</button>
@@ -75,9 +87,9 @@
           </section>
 
           <!-- Month -->
-          <section class="field" style="--i:3">
+          <section class="field" style="--i:4">
             <label class="field__label" for="monthRange">
-              <span class="field__num">03</span> Month
+              <span class="field__num">04</span> Month
               <span class="field__value mono" id="monthValue">January</span>
             </label>
             <input type="range" id="monthRange" min="1" max="12" step="1" value="1" aria-label="Month" />
@@ -85,16 +97,16 @@
           </section>
 
           <!-- Year (historical only) -->
-          <section class="field is-disabled" id="yearField" style="--i:4">
+          <section class="field is-disabled" id="yearField" style="--i:5">
             <label class="field__label" for="yearInput">
-              <span class="field__num">04</span> Year
+              <span class="field__num">05</span> Year
               <span class="field__hint" id="yearHint">climatology — disabled</span>
             </label>
-            <input type="number" id="yearInput" class="numinput mono" min="1981" max="2025" step="1" value="2024" disabled />
+            <input type="number" id="yearInput" class="numinput mono" min="1979" max="2025" step="1" value="2024" disabled />
           </section>
 
           <!-- Compute — the primary action (runs the query above) -->
-          <section class="field" style="--i:5">
+          <section class="field" style="--i:6">
             <button type="button" class="compute" id="computeBtn">
               <span class="compute__label">Compute suitability map</span>
               <span class="compute__meta mono" id="computeMeta">—</span>
@@ -102,19 +114,30 @@
           </section>
 
           <!-- ===== DISPLAY: how to show the result (instant, no recompute) ===== -->
-          <p class="panel__eyebrow" style="--i:6">Display</p>
+          <p class="panel__eyebrow" style="--i:7">Display</p>
 
           <!-- Map rendering: discrete cells vs the smooth 5-class surface -->
-          <section class="field" style="--i:7">
+          <section class="field" id="viewField" style="--i:8">
             <span class="field__label">Map rendering</span>
             <div class="segmented" id="viewToggle" role="radiogroup" aria-label="Map rendering">
               <button type="button" class="segmented__opt is-active" data-view="cells" role="radio" aria-checked="true">Cells</button>
               <button type="button" class="segmented__opt" data-view="smooth" role="radio" aria-checked="false">Smooth</button>
             </div>
+            <p class="note" id="viewNote" hidden></p>
+          </section>
+
+          <!-- Colour scale: fixed 5 classes vs a per-map stretch -->
+          <section class="field" id="scaleField" style="--i:9">
+            <span class="field__label">Colour scale</span>
+            <div class="segmented" id="scaleToggle" role="radiogroup" aria-label="Colour scale">
+              <button type="button" class="segmented__opt is-active" data-scale="absolute" role="radio" aria-checked="true">Absolute</button>
+              <button type="button" class="segmented__opt" data-scale="relative" role="radio" aria-checked="false">Relative</button>
+            </div>
+            <p class="note" id="scaleNote" hidden></p>
           </section>
 
           <!-- Occurrences -->
-          <section class="field field--row" style="--i:8">
+          <section class="field field--row" style="--i:10">
             <label class="switch" for="occToggle">
               <input type="checkbox" id="occToggle" />
               <span class="switch__track"><span class="switch__thumb"></span></span>
@@ -123,13 +146,14 @@
           </section>
 
           <!-- Meta readout -->
-          <section class="readout" id="metaBox" style="--i:9" hidden>
+          <section class="readout" id="metaBox" style="--i:11" hidden>
             <h2 class="readout__title">Field metadata</h2>
             <dl class="readout__grid mono" id="metaGrid"></dl>
+            <p class="readout__note" id="metaNote" hidden></p>
           </section>
 
           <!-- About / caveats -->
-          <section class="about" style="--i:10">
+          <section class="about" style="--i:12">
             <button type="button" class="about__toggle" id="aboutToggle" aria-expanded="false" aria-controls="aboutBody">
               <span>About &amp; caveats</span>
               <svg class="about__chev" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 4l4 4 4-4"/></svg>
@@ -166,7 +190,7 @@
               <span id="welcomeBtnLabel">Compute</span>
               <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h9M8.5 4l4 4-4 4"/></svg>
             </button>
-            <p class="welcome__hint mono">First compute can take ~10s — live NASA POWER climate.</p>
+            <p class="welcome__hint mono" id="welcomeHint">First compute reads live climate data.</p>
           </div>
         </div>
 
@@ -176,9 +200,13 @@
             <span class="map-legend__time mono" id="legendTime">—</span>
             <span class="map-legend__region" id="legendRegion">—</span>
           </header>
-          <h2 class="map-legend__title">Suitability index R<sub>0</sub></h2>
+          <h2 class="map-legend__title">
+            <span>Suitability index R<sub>0</sub></span>
+            <span class="map-legend__tag" id="legendScaleTag" hidden>Relative</span>
+          </h2>
           <ul class="map-legend__list" id="legendList"></ul>
           <p class="map-legend__note mono" id="legendNote">R<sub>0</sub> = 1 — suitability threshold</p>
+          <p class="map-legend__prov mono" id="legendProv" hidden>—</p>
         </section>
 
         <!-- Coordinate / value readout -->
@@ -196,6 +224,8 @@
               <span></span><span></span><span></span><span></span>
             </div>
             <p class="loader__text mono" id="loaderText">Computing suitability field…</p>
+            <p class="loader__sub" id="loaderSub" hidden></p>
+            <p class="loader__elapsed mono" id="loaderElapsed" hidden>0 s</p>
           </div>
         </div>
       </main>
@@ -203,6 +233,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=9" defer></script>
+  <script src="app.js?v=15" defer></script>
 </body>
 </html>

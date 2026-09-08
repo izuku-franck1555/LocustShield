@@ -12,6 +12,13 @@ data/cache/
 *.log
 *.output
 
+# Secrets — the Dockerfile does `COPY . .`, so an un-excluded .env would be
+# baked into an image layer and travel with the image. The container gets the
+# key from the environment (compose `environment:` / `env_file:`), never from
+# a copied file, so no .env belongs in the build context at all.
+.env
+.env.*
+
 # OS
 .DS_Store
 

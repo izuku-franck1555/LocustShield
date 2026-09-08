@@ -12,5 +12,11 @@ data/cache/
 *.log
 *.output
 
+# Secrets — real values live ONLY in an untracked .env on the host.
+# .env.example is the committed, value-less template and is exempted below.
+.env
+.env.*
+!.env.example
+
 # OS
 .DS_Store
