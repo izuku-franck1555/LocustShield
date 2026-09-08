@@ -464,6 +464,7 @@ const state = {
    (occurrences, context labels) keep working untouched.
    --------------------------------------------------------------------- */
 const STUDY_CODES = ['MAR', 'KEN', 'MLI', 'MRT'];   // the four mapped study countries
+const MAX_REGIONS = 12;   // backend cap — refuse past it here rather than 400
 
 function regionByCode(code) {
   return state.regions.find((r) => r.code === code) || null;
@@ -539,10 +540,13 @@ function syncRegionPicker() {
   // Nothing selected is a dead end — say so rather than letting Compute no-op.
   const note = $('#regionNote');
   if (note) {
-    const empty = state.selected.length === 0;
-    note.textContent = empty ? 'Select at least one region to compute a map.' : '';
-    note.classList.toggle('note--warn', empty);
-    note.hidden = !empty;
+    const n = state.selected.length;
+    let msg = '';
+    if (n === 0) msg = 'Select at least one region to compute a map.';
+    else if (n > MAX_REGIONS) msg = `At most ${MAX_REGIONS} regions can be computed at once — deselect ${n - MAX_REGIONS}.`;
+    note.textContent = msg;
+    note.classList.toggle('note--warn', !!msg);
+    note.hidden = !msg;
   }
 }
 
@@ -1187,10 +1191,25 @@ function fieldBbox() {
 /* Provenance grouped by what actually produced each layer. A mixed selection
    must never be flattened into one claim, so this is the single place that
    decides how many distinct claims the map is making. */
+/* Authoritative per-country provenance, keyed by code. The backend publishes
+   meta.per_region for exactly this; the layer's own meta is the fallback for a
+   single-region response (which has no aggregate). */
+function regionProvenance(code) {
+  const agg = (state.surface && state.surface.meta) || null;
+  const per = agg && Array.isArray(agg.per_region) ? agg.per_region : null;
+  const hit = per && per.find((r) => r.code === code);
+  if (hit) return hit;
+  const layer = (state.layers || []).find((L0) => L0.code === code);
+  return (layer && layer.meta) || {};
+}
+
 function provenanceGroups() {
   const groups = [];
   (state.layers || []).forEach((L0) => {
-    const m = L0.meta || {};
+    const m = regionProvenance(L0.code);
+    // Grouped by RESOLUTION as well as source: mixed_resolutions is the common
+    // real case (native 1 km beside a resampled large country) even when every
+    // country came from the same source.
     const key = `${m.source_id || m.source || '?'}|${m.resolution || ''}|${m.render || ''}`;
     let g = groups.find((x) => x.key === key);
     if (!g) {
@@ -1351,8 +1370,40 @@ function regionLabel() {
   return `${names.length} countries`;
 }
 
+/* How many regions the response was ASKED for, as the response itself reports
+   it — not the current selection, which the user may already have changed. */
+function requestedCount() {
+  const m = (state.surface && state.surface.meta) || null;
+  if (m && m.n_requested != null) return m.n_requested;
+  if (m && Array.isArray(m.regions_requested)) return m.regions_requested.length;
+  const failed = (state.surface && state.surface.failed) || [];
+  return (state.layers || []).length + failed.length;
+}
+
+/* Label for the DISPLAYED result. Counts what actually rendered, never the
+   selection: after a partial failure those differ, and a header reading
+   "3 countries" beside "Ethiopia could not be computed" contradicts itself.
+   When some were dropped the ask stays visible as "2 of 3 countries". */
+function renderedRegionLabel() {
+  const layers = state.layers || [];
+  if (!layers.length) return regionLabel();          // nothing drawn yet
+  const names = layers.map((L0) => regionProvenance(L0.code).name || L0.name || L0.code);
+  const asked = requestedCount();
+  const short = names.length === 1 ? names[0]
+    : (names.length === 2 ? names.join(' + ') : `${names.length} countries`);
+  if (asked > names.length) {
+    return names.length === 1
+      ? `${names[0]} (1 of ${asked})`
+      : `${names.length} of ${asked} countries`;
+  }
+  return short;
+}
+
 function updateContext(meta) {
-  const region = regionLabel();
+  // The topbar and legend caption describe the DISPLAYED result, so they count
+  // rendered layers. The Compute button's meta describes the PENDING query and
+  // keeps using the selection — see updateComputeMeta.
+  const region = renderedRegionLabel();
   const modeLabel = (meta && meta.mode === 'month') ? 'Historical' : 'Climatology';
   const monthName = MONTHS[((meta && meta.month) || state.month || 1) - 1];
   const year = meta && meta.year != null ? meta.year : (state.mode === 'month' ? state.year : null);
@@ -1396,7 +1447,11 @@ function provenanceText(meta, full) {
   if (groups.length === 1 && (state.layers || []).length > 1) {
     const g = groups[0];
     const res = full ? g.resolution : (shortRes(g) || g.resolution);
-    return [`${g.source}`, res, g.render, `all ${g.codes.length}`].filter(Boolean).join(' · ');
+    // "all N" only when N really is everything that was asked for; after a
+    // partial failure it is "N of M", not "all".
+    const asked = requestedCount();
+    const count = asked > g.codes.length ? `${g.codes.length} of ${asked}` : `all ${g.codes.length}`;
+    return [`${g.source}`, res, g.render, count].filter(Boolean).join(' · ');
   }
   if (!meta) return '—';
   const res = full ? meta.resolution : (shortRes(meta) || meta.resolution);
@@ -1471,8 +1526,14 @@ function renderLegend() {
   if (note) {
     note.hidden = false;
     note.classList.toggle('is-relative', relative);
+    // The legend is a small floating figure element, so it carries the SHORT
+    // marker; the backend's full scale_note is shown verbatim in the panel
+    // (see applyScaleConstraints), which has room for it.
+    const n = (state.layers || []).length;
     note.innerHTML = relative
-      ? 'Relative stretch — breaks span THIS map only; not comparable between maps.'
+      ? (n > 1
+        ? `Relative stretch — pooled across ${n} countries; not comparable between maps.`
+        : 'Relative stretch — breaks span THIS map only; not comparable between maps.')
       : 'R<sub>0</sub> = 1 — suitability threshold';
   }
 
@@ -1526,7 +1587,8 @@ function renderMeta(meta) {
   rows.push(['Colour scale', relative ? 'Relative (this map)' : 'Absolute (fixed classes)']);
 
   if (multi) {
-    const px = layers.reduce((a, L0) => a + (((L0.meta || {}).n_valid_px) || 0), 0);
+    const px = meta.n_valid_px != null ? meta.n_valid_px
+      : layers.reduce((a, L0) => a + ((regionProvenance(L0.code).n_valid_px) || 0), 0);
     if (px) rows.push(['Valid pixels', px.toLocaleString()]);
   } else if (gridSize && state.surfaceActive) {
     rows.push(['Grid', `${gridSize} px`]);
@@ -1544,11 +1606,43 @@ function renderMeta(meta) {
   // meta.note explains a rendering compromise the numbers above cannot show —
   // e.g. why a large region was read at a coarser step. It is absent when there
   // is nothing to say, which is not an error.
+  // provenance_note explains a mixed selection ("these regions do not share one
+  // resolution — …"); note explains a per-render compromise. Either may be
+  // absent, which means there is nothing to say, not an error.
   const noteEl = $('#metaNote');
   if (noteEl) {
-    noteEl.textContent = meta.note || '';
-    noteEl.hidden = !meta.note;
+    const notes = [meta.provenance_note, meta.note].filter(Boolean);
+    noteEl.innerHTML = notes.map(esc).join('<br><br>');
+    noteEl.hidden = !notes.length;
   }
+}
+
+/* Replace the pre-flight coverage summary with one derived from what actually
+   rendered. The pre-flight predicts; the response is the truth, and a estimate
+   like "3 of 3 at native 1 km" must not outlive a result where only 2 drew.
+   Source labels and resolutions still come from per_region — only the counting
+   is ours. Leaves a fallback REASON note alone: that explains the map and stays
+   true after the compute. */
+function noteResultProvenance() {
+  const el = $('#srcNote');
+  if (!el) return;
+  const layers = state.layers || [];
+  if (layers.length < 2 && requestedCount() < 2) return;   // single-country: nothing to count
+
+  const groups = provenanceGroups();
+  if (!groups.length) return;
+  const asked = requestedCount();
+  const drawn = layers.length;
+
+  const body = groups.length === 1
+    ? `all at ${esc(shortRes(groups[0]) || groups[0].resolution || groups[0].source)}`
+    : groups.map((g) => `${g.codes.length} at ${esc(shortRes(g) || g.resolution)}`).join(' · ');
+
+  el.innerHTML = asked > drawn
+    ? `Rendered <strong>${drawn} of ${asked}</strong> — ${body}.`
+    : `${drawn} rendered, ${body}.`;
+  el.classList.toggle('note--warn', asked > drawn);
+  el.hidden = false;
 }
 
 /* Some countries were requested but not drawn. The map would otherwise look
@@ -1559,14 +1653,23 @@ function noteFailedRegions() {
   const failed = (state.surface && state.surface.failed) || [];
   if (!failed.length) return;                  // leave whatever syncRegionPicker set
 
-  const names = failed.map((f) => {
-    const code = typeof f === 'string' ? f : (f.code || f.region);
+  // A reader comparing countries must be able to tell "not suitable" from
+  // "not computed", so each failure is named with the backend's own reason.
+  const lines = failed.map((f) => {
+    if (typeof f === 'string') {
+      const reg = regionByCode(f);
+      return `<strong>${esc((reg && reg.name) || f)}</strong> could not be computed.`;
+    }
+    const code = f.code || f.region;
     const reg = regionByCode(code);
-    return (reg && reg.name) || code;
+    const name = f.name || (reg && reg.name) || code;
+    const reason = f.reason || f.error || f.detail || '';
+    return `<strong>${esc(name)}</strong> could not be computed` +
+      `${reason ? `: ${esc(reason)}` : '.'}`;
   });
-  const reason = failed.find((f) => f && f.error)?.error;
-  note.innerHTML = `Not drawn: <strong>${esc(names.join(', '))}</strong>` +
-    `${reason ? ` — ${esc(reason)}` : ''}. The map shows the remaining ${(state.layers || []).length}.`;
+  const drawn = (state.layers || []).length;
+  note.innerHTML = lines.join('<br>') +
+    `<br>The map shows the remaining ${drawn} ${drawn === 1 ? 'country' : 'countries'}.`;
   note.classList.add('note--warn');
   note.hidden = false;
 }
@@ -1584,11 +1687,11 @@ function renderRegionProvenance() {
   const groups = provenanceGroups();
   const majority = groups.slice().sort((a, b) => b.codes.length - a.codes.length)[0];
   box.innerHTML = layers.map((L0) => {
-    const m = L0.meta || {};
+    const m = regionProvenance(L0.code);
     const odd = groups.length > 1 && majority && !majority.codes.includes(L0.code);
     const src = [m.source || '—', shortRes(m)].filter(Boolean).join(' ');
     return `<div class="readout__region${odd ? ' is-odd' : ''}">` +
-      `<span class="readout__region-name">${esc(L0.name || L0.code)}</span>` +
+      `<span class="readout__region-name">${esc(m.name || L0.name || L0.code)}</span>` +
       `<span class="readout__region-src">${esc(src)}</span></div>`;
   }).join('');
   box.hidden = false;
@@ -1768,6 +1871,10 @@ async function compute() {
     }
 
     renderField(data, surface);
+    // Order matters: the result-derived summary replaces the stale pre-flight,
+    // then a source substitution or a failure overrides it with the more
+    // important message. Most specific wins.
+    noteResultProvenance();
     reconcileProvenance(displayMeta());
     noteFailedRegions();
     if (refusal) noteRefusal(refusal);
@@ -1846,9 +1953,10 @@ function updateRunButton() {
   // Nothing selected → nothing to compute. Disable rather than leaving a button
   // that silently does nothing; the region note says what to do about it.
   if (!computing) {
-    const empty = !state.selected.length;
-    btn.disabled = empty;
-    const wbtn = $('#welcomeCompute'); if (wbtn) wbtn.disabled = empty;
+    const n = state.selected.length;
+    const blocked = n === 0 || n > MAX_REGIONS;
+    btn.disabled = blocked;
+    const wbtn = $('#welcomeCompute'); if (wbtn) wbtn.disabled = blocked;
   }
   if (!state.hasResult)      { if (label) label.textContent = 'Compute suitability map'; btn.classList.remove('is-stale'); }
   else if (state.dirty)      { if (label) label.textContent = 'Update map';              btn.classList.add('is-stale'); }
@@ -1993,7 +2101,12 @@ function applyScaleConstraints() {
     note.classList.add('note--warn');
     note.hidden = false;
   } else if (displayScale() === 'relative') {
-    note.textContent = 'Breaks are stretched to this map only — for visual comparison, not for reading absolute suitability.';
+    // Prefer the backend's own scale_note: with several countries the breaks are
+    // POOLED across them rather than stretched per country, and only the server
+    // can state how it actually binned them.
+    const meta = displayMeta();
+    note.textContent = (meta && meta.scale_note)
+      || 'Breaks are stretched to this map only — for visual comparison, not for reading absolute suitability.';
     note.classList.remove('note--warn');
     note.hidden = false;
   } else {
