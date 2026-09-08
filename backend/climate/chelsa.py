@@ -391,7 +391,10 @@ class ChelsaProvider(ClimateProvider):
     def _disk_put(self, key: str, field: RasterField) -> None:
         os.makedirs(self.cache_dir, exist_ok=True)
         path = self._cache_path(key)
-        tmp = path + ".tmp"
+        # Unique temp name per writer: multi-region requests fetch concurrently,
+        # and two threads writing the same key through a shared ".tmp" would
+        # interleave into a corrupt file. os.replace stays atomic.
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
             with open(tmp, "wb") as fh:
                 np.savez_compressed(

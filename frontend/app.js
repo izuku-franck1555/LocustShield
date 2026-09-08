@@ -355,9 +355,11 @@ function isRefusal(err) {
    `source` and `scale` are additive: a backend that predates them ignores the
    extra params, which is exactly the graceful-degrade path we want. */
 function queryFor(region, params, extra) {
-  const q = new URLSearchParams({
-    region: region.code, level: 0, mode: params.mode, month: params.month,
-  });
+  const q = new URLSearchParams({ level: 0, mode: params.mode, month: params.month });
+  // A single country keeps using `region=` — that path is byte-compatible and
+  // must not regress. `regions=` is only sent when there really are several.
+  if (params.regions && params.regions.length > 1) q.set('regions', params.regions.join(','));
+  else q.set('region', (region && region.code) || params.regions[0]);
   if (params.mode === 'month') q.set('year', params.year);
   if (params.ramp)   q.set('ramp', params.ramp);
   if (params.source) q.set('source', params.source);
@@ -395,9 +397,10 @@ const api = {
      backend's own resolution logic, so its verdict cannot drift from what the
      render endpoints actually do — that is why it, not a client-side rule, is
      the authority for which source we request. */
-  coverage: (mode, month, year, source) => {
+  coverage: (mode, month, year, source, regions) => {
     const q = new URLSearchParams({ mode, month, source });
     if (mode === 'month') q.set('year', year);
+    if (regions && regions.length) q.set('regions', regions.join(','));
     return apiGet(`/api/coverage?${q}`, 15000);
   },
 
@@ -423,7 +426,8 @@ const api = {
    ===================================================================== */
 const state = {
   regions: [],
-  region: null,
+  region: null,       // FIRST selected region object — occurrences + single-region paths
+  selected: [],       // selected region codes, kept in preset order for stable display
   mode: 'climatology',
   month: 1,
   year: 2024,
@@ -450,17 +454,128 @@ const state = {
   coverageKey: null,   // the query that verdict belongs to (guards against staleness)
   coverageLive: true,  // the endpoint exists (false → fall back to local rules)
   basemap: { key: null, provider: 'carto' },  // from /api/config at runtime
+  layers: [],          // normalised displayed layers: {code,name,image,bounds,boundary,meta}
 };
+
+/* ---------------------------------------------------------------------
+   REGION SELECTION
+   The map may show one country or several. Selection is a set of codes;
+   `state.region` stays the FIRST of them so the single-region paths
+   (occurrences, context labels) keep working untouched.
+   --------------------------------------------------------------------- */
+const STUDY_CODES = ['MAR', 'KEN', 'MLI', 'MRT'];   // the four mapped study countries
+
+function regionByCode(code) {
+  return state.regions.find((r) => r.code === code) || null;
+}
+function selectedRegions() {
+  return state.selected.map(regionByCode).filter(Boolean);
+}
+function isMulti() {
+  return state.selected.length > 1;
+}
+/* Names for display, in preset order. */
+function selectedNames() {
+  return selectedRegions().map((r) => r.name);
+}
+
+/* Apply a new selection: normalise to preset order, drop unknown codes, and
+   keep state.region pointing at the first survivor. */
+function setSelection(codes) {
+  const set = new Set(codes);
+  state.selected = state.regions.filter((r) => set.has(r.code)).map((r) => r.code);
+  state.region = regionByCode(state.selected[0]) || null;
+  syncRegionPicker();
+  queryChanged();
+}
 
 /* Identity of the current time slice + source selection. Coverage is only
    trusted while this matches, so an in-flight or stale verdict is never
    applied to a different query. */
 function queryKey() {
-  return [state.mode, state.month, state.mode === 'month' ? state.year : '-', state.source].join('|');
+  return [state.mode, state.month, state.mode === 'month' ? state.year : '-',
+    state.source, state.selected.join(',')].join('|');
 }
 
-let map, cellLayer = null, boundaryLayer = null, occLayer = null,
-    surfaceLayer = null, labelsLayer = null;
+/* Build the region checkbox list once the presets are known. */
+function renderRegionPicker() {
+  const list = $('#regionList');
+  if (!list) return;
+  list.innerHTML = state.regions.map((r) => `
+    <li class="picker__row">
+      <label class="picker__opt">
+        <input type="checkbox" value="${esc(r.code)}" />
+        <span class="picker__box" aria-hidden="true"></span>
+        <span class="picker__name">${esc(r.name)}</span>
+      </label>
+      <button type="button" class="picker__only" data-only="${esc(r.code)}"
+              title="Show only ${esc(r.name)}">only</button>
+    </li>`).join('');
+
+  list.addEventListener('change', (e) => {
+    const cb = e.target.closest('input[type="checkbox"]');
+    if (!cb) return;
+    const codes = new Set(state.selected);
+    if (cb.checked) codes.add(cb.value); else codes.delete(cb.value);
+    setSelection([...codes]);
+  });
+  list.addEventListener('click', (e) => {
+    const only = e.target.closest('.picker__only');
+    if (!only) return;
+    setSelection([only.dataset.only]);   // one click back to a single country
+  });
+}
+
+/* Reflect state.selected in the checkboxes + the count caption. */
+function syncRegionPicker() {
+  $$('#regionList input[type="checkbox"]').forEach((cb) => {
+    cb.checked = state.selected.includes(cb.value);
+  });
+  const count = $('#regionCount');
+  if (count) {
+    const n = state.selected.length;
+    count.textContent = n === 0 ? 'none' : (n === 1 ? selectedNames()[0] : `${n} selected`);
+  }
+  // Nothing selected is a dead end — say so rather than letting Compute no-op.
+  const note = $('#regionNote');
+  if (note) {
+    const empty = state.selected.length === 0;
+    note.textContent = empty ? 'Select at least one region to compute a map.' : '';
+    note.classList.toggle('note--warn', empty);
+    note.hidden = !empty;
+  }
+}
+
+let map, cellLayer = null, occLayer = null, labelsLayer = null;
+/* One raster + one outline PER country: the backend renders each country
+   separately so each keeps its own best resolution, so the client draws each
+   at its own bounds rather than stretching one image over the union. */
+let surfaceLayers = [], boundaryLayers = [];
+
+function clearSurfaceLayers() {
+  surfaceLayers.forEach((l) => l.remove());
+  boundaryLayers.forEach((l) => l.remove());
+  surfaceLayers = []; boundaryLayers = [];
+}
+
+/* Draw every layer of a normalised surface. Outlines go on after all rasters so
+   no country's fill covers a neighbour's border. */
+function addSurfaceLayers(surface) {
+  clearSurfaceLayers();
+  if (!surface || !surface.layers) return;
+  surface.layers.forEach((L0) => {
+    surfaceLayers.push(L.imageOverlay(L0.image, L0.bounds, {
+      opacity: 1, interactive: false, className: 'r0-surface',
+    }).addTo(map));
+  });
+  surface.layers.forEach((L0) => {
+    if (!L0.boundary) return;
+    boundaryLayers.push(L.geoJSON(L0.boundary, {
+      interactive: false,
+      style: { color: '#1b2733', weight: 1.4, opacity: 0.92, fill: false, lineJoin: 'round' },
+    }).addTo(map));
+  });
+}
 
 /* =====================================================================
    CLIMATE SOURCE  ——  capability lookup + honest fallback resolution.
@@ -571,7 +686,7 @@ async function refreshCoverage() {
   if (state.coverageKey === key && state.coverage) return;
   const seq = ++coverageSeq;
   try {
-    const cov = await api.coverage(state.mode, state.month, state.year, state.source);
+    const cov = await api.coverage(state.mode, state.month, state.year, state.source, state.selected);
     if (seq !== coverageSeq) return;            // a newer query superseded this
     state.coverage = cov;
     state.coverageKey = key;
@@ -644,6 +759,11 @@ function updateSourceNote() {
     html = `${r.auto ? 'Auto → ' : ''}${esc(got)}.`;
   }
 
+  // A mixed selection may split across sources; when the backend reports that
+  // per region, say how it splits instead of implying one source for all.
+  const split = coverageSplit();
+  if (split) { html = split.html; warn = split.warn; }
+
   el.innerHTML = html;
   el.classList.toggle('note--warn', warn);
   el.hidden = false;
@@ -654,6 +774,46 @@ function updateSourceNote() {
 
   updateWelcomeHint(r);
   applyScaleConstraints();
+}
+
+/* If /api/coverage reports per-region verdicts for a multi-country selection,
+   summarise the split ("3 use CHELSA ~1 km · 2 fall back to NASA POWER").
+   Returns null when the selection is single, or when the backend gives only one
+   verdict — in which case the caller's single-source wording is accurate. */
+function coverageSplit() {
+  if (!isMulti()) return null;
+  const cov = state.coverage;
+  if (!cov || state.coverageKey !== queryKey()) return null;
+
+  // NOTE: cov.regions is a list of CODES, not per-region verdicts — only
+  // per_region carries objects. Reading the wrong one yields "unknown" labels.
+  const per = Array.isArray(cov.per_region) ? cov.per_region : null;
+  if (!per || !per.length) return null;
+
+  const buckets = new Map();
+  per.forEach((r) => {
+    const label = r.resolved_label || r.resolved_source || 'unknown';
+    const res = r.resolution || r.resolved_resolution || '';
+    const key = `${label}|${res}`;
+    if (!buckets.has(key)) buckets.set(key, { label, res, codes: [] });
+    buckets.get(key).codes.push(r.code);
+  });
+  const groups = [...buckets.values()];
+
+  // The backend writes its own one-line summary; prefer it so this wording can
+  // never drift from the resolution logic that produced it.
+  if (cov.summary) return { html: esc(cov.summary) + '.', warn: groups.length > 1 };
+
+  if (groups.length < 2) {
+    const g = groups[0];
+    return { html: `All ${per.length} regions → ${esc(g.label)}${g.res ? ' ' + esc(shortRes({ resolution: g.res })) : ''}.`, warn: false };
+  }
+  return {
+    warn: true,
+    html: groups
+      .map((g) => `${g.codes.length} → ${esc(g.label)}${g.res ? ' ' + esc(shortRes({ resolution: g.res })) : ''}`)
+      .join(' · ') + '.',
+  };
 }
 
 /* First-run hint has to set the right expectation for the resolved source. */
@@ -764,17 +924,38 @@ async function queryPoint(latlng) {
   // Placeholder in the one existing tooltip — replaced in place, never added to.
   showProbe(latlng, '<span class="cell-tip__pending">R₀ </span>');
   try {
+    // Multi-country: the backend resolves the point to whichever selected
+    // country contains it, so the whole selection is sent.
     const params = {
       mode: state.mode, month: state.month, year: state.year,
       source: state.servedSource || state.requestedSource || undefined,
+      regions: state.selected.slice(),
     };
     const p = await api.point(state.region, params, latlng.lat, latlng.lng, signal);
     if (seq !== probeSeq) return;                       // a newer hover won
-    showProbe(latlng, cellTooltip(p || {}));
+    showProbe(latlng, pointTooltip(p));
   } catch (err) {
     if (seq !== probeSeq || (err && err.name === 'AbortError')) return;
     showProbe(latlng, '<span class="cell-tip__null">value unavailable here</span>');
   }
+}
+
+/* Readout for a point response. Adds two things the cell probe cannot know:
+   which of the selected countries the value came from (only worth saying when
+   several are on screen), and the backend's own explanation when there is no
+   value — "outside every selected region" beats a bare "no data". */
+function pointTooltip(p) {
+  if (!p) return cellTooltip(null);
+  const meta = p.meta || {};
+  if (p.r0 == null) {
+    return meta.note
+      ? `<span class="cell-tip__null">${esc(meta.note)}</span>`
+      : cellTooltip(p);
+  }
+  const body = cellTooltip(p);
+  if (!isMulti() || !meta.region) return body;
+  const reg = regionByCode(meta.region);
+  return `<span class="cell-tip__where">${esc((reg && reg.name) || meta.region)}</span> · ${body}`;
 }
 
 /* Turn the point probe on/off and mirror it in the map cursor. */
@@ -910,8 +1091,8 @@ function fmtLon(v) {
 async function fetchSurface(region, params, required) {
   if (CONFIG.USE_MOCK || !CONFIG.USE_SURFACE) return null;
   try {
-    const j = await apiGet(`/api/r0_surface?${queryFor(region, params)}`);
-    if (!j || !j.image || !j.bounds) {
+    const j = normaliseSurface(await apiGet(`/api/r0_surface?${queryFor(region, params)}`), params);
+    if (!j) {
       if (required) throw new Error('empty surface response');
       return null;
     }
@@ -923,6 +1104,46 @@ async function fetchSurface(region, params, required) {
   }
 }
 
+/* Collapse the two response shapes into ONE internal form so nothing
+   downstream has to branch:
+     single  -> {image, bounds, boundary, legend, bbox, meta}
+     multi   -> {layers:[{code,name,image,bounds,boundary,meta}], bbox, legend, meta}
+   Both become {layers:[...], bbox, legend, meta}. A one-country selection keeps
+   using the single endpoint, so this is also what guarantees no regression. */
+function normaliseSurface(resp, params) {
+  if (!resp) return null;
+
+  if (Array.isArray(resp.layers)) {
+    const layers = resp.layers.filter((l) => l && l.image && l.bounds);
+    if (!layers.length) return null;
+    return {
+      layers,
+      bbox: resp.bbox || null,
+      legend: resp.legend || [],
+      meta: resp.meta || (layers[0] && layers[0].meta) || null,
+      // Regions the backend could not render. Silently drawing fewer countries
+      // than were asked for would misrepresent the map, so this is surfaced.
+      failed: Array.isArray(resp.failed) ? resp.failed : [],
+      multi: true,
+    };
+  }
+
+  if (!resp.image || !resp.bounds) return null;
+  const code = (params && params.regions && params.regions[0]) || (state.region && state.region.code);
+  const reg = regionByCode(code);
+  return {
+    layers: [{
+      code, name: reg ? reg.name : code,
+      image: resp.image, bounds: resp.bounds,
+      boundary: resp.boundary || null, meta: resp.meta || null,
+    }],
+    bbox: resp.bbox || null,
+    legend: resp.legend || [],
+    meta: resp.meta || null,
+    multi: false,
+  };
+}
+
 /* =====================================================================
    Displayed-result accessors.
    A result is now one of two shapes: cell geometry (+ optional raster) from
@@ -932,15 +1153,53 @@ async function fetchSurface(region, params, required) {
    ===================================================================== */
 function displayMeta() {
   const s = state.surface, f = state.field;
-  if (state.surfaceActive && s && s.meta) return s.meta;
+  if (state.surfaceActive && s) {
+    // The multi-region aggregate meta need not repeat every per-layer field, so
+    // fill any gaps from the first layer. Nothing is invented — a key is only
+    // taken from a layer when the aggregate does not define it at all.
+    const first = (s.layers && s.layers[0] && s.layers[0].meta) || null;
+    if (s.meta && first) return Object.assign({}, first, s.meta);
+    return s.meta || first;
+  }
   if (f && f.meta) return f.meta;
   return (s && s.meta) || null;
 }
 
 function fieldBbox() {
+  if (state.surfaceActive && state.surface && state.surface.bbox) return state.surface.bbox;
   if (state.field && state.field.bbox) return state.field.bbox;
   if (state.surface && state.surface.bbox) return state.surface.bbox;
+  // No union supplied — derive it from the layer bounds so a multi-country map
+  // still fits everything rather than fitting only the first country.
+  const ls = state.layers || [];
+  if (ls.length) {
+    let w = 180, s = 90, e = -180, n = -90;
+    ls.forEach((L0) => {
+      const b = L0.bounds; if (!b) return;
+      s = Math.min(s, b[0][0]); w = Math.min(w, b[0][1]);
+      n = Math.max(n, b[1][0]); e = Math.max(e, b[1][1]);
+    });
+    if (w <= e && s <= n) return [w, s, e, n];
+  }
   return null;
+}
+
+/* Provenance grouped by what actually produced each layer. A mixed selection
+   must never be flattened into one claim, so this is the single place that
+   decides how many distinct claims the map is making. */
+function provenanceGroups() {
+  const groups = [];
+  (state.layers || []).forEach((L0) => {
+    const m = L0.meta || {};
+    const key = `${m.source_id || m.source || '?'}|${m.resolution || ''}|${m.render || ''}`;
+    let g = groups.find((x) => x.key === key);
+    if (!g) {
+      g = { key, source: m.source || '—', resolution: m.resolution || '', render: m.render ? renderLabel(m) : '', codes: [] };
+      groups.push(g);
+    }
+    g.codes.push(L0.code);
+  });
+  return groups;
 }
 
 /* The legend that describes what is PAINTED right now. In relative mode the
@@ -992,8 +1251,9 @@ function cellTooltip(p) {
 function renderField(data, surface) {
   state.field = data || null;
   state.surface = surface || null;
+  state.layers = (surface && surface.layers) || [];
 
-  const haveSurface = !!(surface && surface.image && surface.bounds);
+  const haveSurface = state.layers.length > 0;
   const haveCells = !!(data && data.features && data.features.length);
 
   // View design: CELLS = discrete opaque cells with a visible grid (one colour
@@ -1009,17 +1269,12 @@ function renderField(data, surface) {
 
   // Clear prior layers (and any open probe / in-flight point request)
   clearTimeout(probeHideTimer); cancelPointProbe(); hideProbe();
-  if (surfaceLayer)  { surfaceLayer.remove();  surfaceLayer = null; }
-  if (cellLayer)     { cellLayer.remove();     cellLayer = null; }
-  if (boundaryLayer) { boundaryLayer.remove(); boundaryLayer = null; }
+  clearSurfaceLayers();
+  if (cellLayer) { cellLayer.remove(); cellLayer = null; }
 
-  // Surface raster — added below the cells so transparent cells stay the
+  // Surface rasters — added below the cells so transparent cells stay the
   // hover/probe layer on top when cell geometry exists.
-  if (state.surfaceActive) {
-    surfaceLayer = L.imageOverlay(surface.image, surface.bounds, {
-      opacity: 1, interactive: false, className: 'r0-surface',
-    }).addTo(map);
-  }
+  if (state.surfaceActive) addSurfaceLayers(surface);
 
   // Cells — painted when no surface; transparent hover/probe geometry when a
   // surface is shown. NO per-feature tooltips and NO bringToFront. Instead, a
@@ -1046,14 +1301,13 @@ function renderField(data, surface) {
   // Exactly one of the two probes is ever live.
   setPointProbe(!haveCells && state.surfaceActive);
 
-  // Boundary outline — crisp dark stroke that defines the figure. A raster-only
-  // response may carry it too; if neither does, the masked raster edge stands in.
-  const boundary = (data && data.boundary) || (surface && surface.boundary) || null;
-  if (boundary) {
-    boundaryLayer = L.geoJSON(boundary, {
+  // Cells-view outline. In Smooth view each layer already drew its own (see
+  // addSurfaceLayers); here the cells response supplies the single-region one.
+  if (!state.surfaceActive && data && data.boundary) {
+    boundaryLayers.push(L.geoJSON(data.boundary, {
       interactive: false,
       style: { color: '#1b2733', weight: 1.4, opacity: 0.92, fill: false, lineJoin: 'round' },
-    }).addTo(map);
+    }).addTo(map));
   }
 
   // Fit to bbox — invalidate first so we always fit to the CURRENT container
@@ -1087,8 +1341,18 @@ function renderField(data, surface) {
 }
 
 /* Live context readout (top bar + legend caption) */
+/* Label for the current selection: a name when it is one country, a count when
+   it is several (the per-country list lives in the metadata panel). */
+function regionLabel() {
+  const names = selectedNames();
+  if (!names.length) return '—';
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return names.join(' + ');
+  return `${names.length} countries`;
+}
+
 function updateContext(meta) {
-  const region = state.region ? state.region.name : '—';
+  const region = regionLabel();
   const modeLabel = (meta && meta.mode === 'month') ? 'Historical' : 'Climatology';
   const monthName = MONTHS[((meta && meta.month) || state.month || 1) - 1];
   const year = meta && meta.year != null ? meta.year : (state.mode === 'month' ? state.year : null);
@@ -1120,6 +1384,20 @@ function updateContext(meta) {
    `full` keeps the exact resolution string and the long render wording for the
    metadata panel; the compact form is for the topbar and legend footer. */
 function provenanceText(meta, full) {
+  // A multi-country map may be making SEVERAL different claims at once. Report
+  // each one with how many countries it covers — never collapse them into a
+  // single source/resolution the whole map does not actually have.
+  const groups = provenanceGroups();
+  if (groups.length > 1) {
+    return groups
+      .map((g) => `${g.source}${g.resolution ? ' ' + (full ? g.resolution : shortRes(g)) : ''} (${g.codes.length})`)
+      .join(' · ');
+  }
+  if (groups.length === 1 && (state.layers || []).length > 1) {
+    const g = groups[0];
+    const res = full ? g.resolution : (shortRes(g) || g.resolution);
+    return [`${g.source}`, res, g.render, `all ${g.codes.length}`].filter(Boolean).join(' · ');
+  }
   if (!meta) return '—';
   const res = full ? meta.resolution : (shortRes(meta) || meta.resolution);
   return [meta.source || '—', res, renderLabel(meta, full)]
@@ -1225,16 +1503,32 @@ function renderMeta(meta) {
     : null;
   const relative = displayScale() === 'relative';
 
+  const layers = state.layers || [];
+  const multi = state.surfaceActive && layers.length > 1;
+
   const rows = [
     ['Mode', meta.mode === 'month' ? 'Historical' : 'Climatology'],
     ['Month', MONTHS[(meta.month || 1) - 1]],
     ['Year', meta.year != null ? meta.year : '—'],
-    ['Source', meta.source || '—'],
-    ['Native resolution', meta.resolution || '—'],
-    ['Render', renderLabel(meta, true) || '—'],
-    ['Colour scale', relative ? 'Relative (this map)' : 'Absolute (fixed classes)'],
   ];
-  if (gridSize && state.surfaceActive) {
+
+  if (multi) {
+    // One Source/Resolution/Render row would assert a single provenance the map
+    // may not have. Summarise per distinct source; the per-country rows below
+    // carry the detail.
+    rows.push(['Countries', String(layers.length)]);
+    rows.push(['Sources', provenanceText(meta, true)]);
+  } else {
+    rows.push(['Source', meta.source || '—']);
+    rows.push(['Native resolution', meta.resolution || '—']);
+    rows.push(['Render', renderLabel(meta, true) || '—']);
+  }
+  rows.push(['Colour scale', relative ? 'Relative (this map)' : 'Absolute (fixed classes)']);
+
+  if (multi) {
+    const px = layers.reduce((a, L0) => a + (((L0.meta || {}).n_valid_px) || 0), 0);
+    if (px) rows.push(['Valid pixels', px.toLocaleString()]);
+  } else if (gridSize && state.surfaceActive) {
     rows.push(['Grid', `${gridSize} px`]);
     if (meta.n_valid_px != null) rows.push(['Valid pixels', meta.n_valid_px.toLocaleString()]);
   } else {
@@ -1245,6 +1539,8 @@ function renderMeta(meta) {
     .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`)
     .join('');
 
+  renderRegionProvenance();
+
   // meta.note explains a rendering compromise the numbers above cannot show —
   // e.g. why a large region was read at a coarser step. It is absent when there
   // is nothing to say, which is not an error.
@@ -1253,6 +1549,49 @@ function renderMeta(meta) {
     noteEl.textContent = meta.note || '';
     noteEl.hidden = !meta.note;
   }
+}
+
+/* Some countries were requested but not drawn. The map would otherwise look
+   complete while quietly missing a country the user selected. */
+function noteFailedRegions() {
+  const note = $('#regionNote');
+  if (!note) return;
+  const failed = (state.surface && state.surface.failed) || [];
+  if (!failed.length) return;                  // leave whatever syncRegionPicker set
+
+  const names = failed.map((f) => {
+    const code = typeof f === 'string' ? f : (f.code || f.region);
+    const reg = regionByCode(code);
+    return (reg && reg.name) || code;
+  });
+  const reason = failed.find((f) => f && f.error)?.error;
+  note.innerHTML = `Not drawn: <strong>${esc(names.join(', '))}</strong>` +
+    `${reason ? ` — ${esc(reason)}` : ''}. The map shows the remaining ${(state.layers || []).length}.`;
+  note.classList.add('note--warn');
+  note.hidden = false;
+}
+
+/* Per-country provenance rows. Shown whenever more than one country is drawn,
+   so the aggregate header is never the only claim on screen. Countries served
+   by a minority source are marked, since that is the case a reader must not
+   miss when comparing them. */
+function renderRegionProvenance() {
+  const box = $('#metaRegions');
+  if (!box) return;
+  const layers = state.layers || [];
+  if (!state.surfaceActive || layers.length < 2) { box.hidden = true; box.innerHTML = ''; return; }
+
+  const groups = provenanceGroups();
+  const majority = groups.slice().sort((a, b) => b.codes.length - a.codes.length)[0];
+  box.innerHTML = layers.map((L0) => {
+    const m = L0.meta || {};
+    const odd = groups.length > 1 && majority && !majority.codes.includes(L0.code);
+    const src = [m.source || '—', shortRes(m)].filter(Boolean).join(' ');
+    return `<div class="readout__region${odd ? ' is-odd' : ''}">` +
+      `<span class="readout__region-name">${esc(L0.name || L0.code)}</span>` +
+      `<span class="readout__region-src">${esc(src)}</span></div>`;
+  }).join('');
+  box.hidden = false;
 }
 
 function renderCaveats(meta) {
@@ -1268,9 +1607,19 @@ function renderCaveats(meta) {
    ===================================================================== */
 async function loadOccurrences() {
   if (occLayer) { occLayer.remove(); occLayer = null; }
-  if (!state.showOcc || !state.region) return;
+  if (!state.showOcc || !state.selected.length) return;
   try {
-    const fc = await api.occurrences(state.region, state.field);
+    // /api/occurrences serves one region, so fetch each selected country and
+    // merge. A country with no points must not fail the whole overlay.
+    const regions = selectedRegions();
+    const results = await Promise.all(regions.map((r) =>
+      api.occurrences(r, state.field).catch((err) => {
+        console.warn(`[R0] occurrences failed for ${r.code}:`, err.message);
+        return null;
+      })));
+    const features = results.filter(Boolean).flatMap((f) => (f && f.features) || []);
+    if (!features.length) return;
+    const fc = { type: 'FeatureCollection', features };
     occLayer = L.geoJSON(fc, {
       pointToLayer: (feat, latlng) =>
         L.marker(latlng, {
@@ -1326,6 +1675,7 @@ function setBusy(on) {
   if (panel) { panel.classList.toggle('is-busy', !!on); panel.setAttribute('aria-busy', on ? 'true' : 'false'); }
   const btn = $('#computeBtn'); if (btn) btn.disabled = !!on;
   const wbtn = $('#welcomeCompute'); if (wbtn) wbtn.disabled = !!on;
+  if (!on) updateRunButton();   // restore the empty-selection disable, if any
 }
 
 /* =====================================================================
@@ -1337,7 +1687,7 @@ let computing = false;
 function computeParams(sourceId) {
   return {
     mode: state.mode, month: state.month, year: state.year, ramp: 'bins',
-    source: sourceId, scale: state.scale,
+    source: sourceId, scale: state.scale, regions: state.selected.slice(),
   };
 }
 
@@ -1347,10 +1697,13 @@ function computeParams(sourceId) {
    the Cells view and the hover hit-test, the raster is the Smooth view. */
 async function runQuery(sourceId) {
   const params = computeParams(sourceId);
-  const native = sourceId === 'chelsa';
+  // Cells come from /api/r0, which serves ONE region and does not serve the
+  // native high-resolution source. So cells are fetched only for a single
+  // coarse-source country; otherwise the raster is the map and must succeed.
+  const wantCells = sourceId !== 'chelsa' && params.regions.length === 1;
   const [data, surface] = await Promise.all([
-    native ? Promise.resolve(null) : api.r0(state.region, params),
-    fetchSurface(state.region, params, native),
+    wantCells ? api.r0(state.region, params) : Promise.resolve(null),
+    fetchSurface(state.region, params, !wantCells),
   ]);
   if (!data && !surface) throw new Error('no field returned');
   return [data, surface];
@@ -1369,7 +1722,7 @@ function noteRefusal(detail) {
 }
 
 async function compute() {
-  if (computing || !state.region) return;
+  if (computing || !state.selected.length) return;
   computing = true;
   setBusy(true);
 
@@ -1381,13 +1734,19 @@ async function compute() {
   const resolved = resolveSource();
   state.requestedSource = resolved.id;
   const native = resolved.id === 'chelsa';
-  const where = `${state.region.name} · ${MONTHS_SHORT[state.month - 1]}`;
+  const n = state.selected.length;
+  const month = MONTHS_SHORT[state.month - 1];
+  const where = n === 1 ? `${state.region.name} · ${month}` : `${n} countries · ${month}`;
 
+  // Naming the countries is the honest form of progress here: the backend
+  // returns one response for the whole set, so per-country completion is not
+  // observable from the client and inventing it would be a fake progress bar.
+  const roster = n > 1 ? selectedNames().join(' · ') : '';
   showLoader(
     native ? `Reading ${sourceName(resolved.id)} rasters — ${where}` : `Computing ${where}…`,
-    native
-      ? 'First run for this region and month; the result is cached afterwards.'
-      : '');
+    n > 1
+      ? `${roster} — computed concurrently; the first run for each is slower, then cached.`
+      : (native ? 'First run for this region and month; the result is cached afterwards.' : ''));
 
   try {
     let data, surface, refusal = null;
@@ -1410,6 +1769,7 @@ async function compute() {
 
     renderField(data, surface);
     reconcileProvenance(displayMeta());
+    noteFailedRegions();
     if (refusal) noteRefusal(refusal);
     state.hasResult = true;
     state.dirty = false;
@@ -1468,7 +1828,7 @@ function coverageLabel(s) {
 }
 
 function updateComputeMeta() {
-  const region = state.region ? state.region.name : 'a region';
+  const region = state.selected.length ? regionLabel() : 'a region';
   const time = queryTimeLabel();
   // The button meta describes the PENDING query. Resolution is deliberately NOT
   // repeated here — the source note directly above already states it, and the
@@ -1482,6 +1842,14 @@ function updateComputeMeta() {
 function updateRunButton() {
   const btn = $('#computeBtn'); if (!btn) return;
   const label = btn.querySelector('.compute__label');
+
+  // Nothing selected → nothing to compute. Disable rather than leaving a button
+  // that silently does nothing; the region note says what to do about it.
+  if (!computing) {
+    const empty = !state.selected.length;
+    btn.disabled = empty;
+    const wbtn = $('#welcomeCompute'); if (wbtn) wbtn.disabled = empty;
+  }
   if (!state.hasResult)      { if (label) label.textContent = 'Compute suitability map'; btn.classList.remove('is-stale'); }
   else if (state.dirty)      { if (label) label.textContent = 'Update map';              btn.classList.add('is-stale'); }
   else                       { if (label) label.textContent = 'Recompute';              btn.classList.remove('is-stale'); }
@@ -1540,22 +1908,24 @@ function setView(view) {
   syncViewButtons();
   if (!cellLayer && !state.surface) return;  // nothing rendered yet
 
-  // SMOOTH shows the surface raster (cached at compute) over transparent cells;
-  // CELLS removes the surface and paints discrete cells with a grid.
+  // SMOOTH shows the surface rasters (cached at compute) over transparent cells;
+  // CELLS removes them and paints discrete cells with a grid.
   const s = state.surface;
-  const haveSurface = !!(s && s.image && s.bounds);
+  const haveSurface = !!(s && s.layers && s.layers.length);
   state.surfaceActive = haveSurface && view === 'smooth';
   if (state.surfaceActive) {
-    if (surfaceLayer) {
-      surfaceLayer.setOpacity(1);
-    } else {
-      surfaceLayer = L.imageOverlay(s.image, s.bounds, {
-        opacity: 1, interactive: false, className: 'r0-surface',
-      }).addTo(map);
+    if (!surfaceLayers.length) {
+      addSurfaceLayers(s);
       if (cellLayer) cellLayer.bringToFront();   // keep transparent cells on top for hover
     }
-  } else if (surfaceLayer) {
-    surfaceLayer.remove(); surfaceLayer = null;  // cells view → discrete painted cells
+  } else if (surfaceLayers.length) {
+    clearSurfaceLayers();                        // cells view → discrete painted cells
+    if (state.field && state.field.boundary) {
+      boundaryLayers.push(L.geoJSON(state.field.boundary, {
+        interactive: false,
+        style: { color: '#1b2733', weight: 1.4, opacity: 0.92, fill: false, lineJoin: 'round' },
+      }).addTo(map));
+    }
   }
   refreshLabels();
 
@@ -1586,10 +1956,17 @@ function applyViewConstraints() {
   }
   if (note) {
     const meta = displayMeta();
-    note.textContent = rasterOnly
-      ? `${(meta && meta.source) || 'This source'} is drawn as a ${(meta && meta.resolution) || 'native'} raster — there is no coarse cell grid to show.`
-      : '';
-    note.hidden = !rasterOnly;
+    let text = '';
+    if (rasterOnly && (state.layers || []).length > 1) {
+      // Cells come from a single-region endpoint, so a multi-country map has no
+      // cell grid regardless of source — say that, not the source-specific line.
+      text = 'Several countries are drawn as rasters — select a single country to use the cell grid.';
+    } else if (rasterOnly) {
+      text = `${(meta && meta.source) || 'This source'} is drawn as a ` +
+        `${(meta && meta.resolution) || 'native'} raster — there is no coarse cell grid to show.`;
+    }
+    note.textContent = text;
+    note.hidden = !text;
   }
 }
 
@@ -1668,11 +2045,10 @@ async function setScale(scale) {
    and zoom. Legend + metadata follow the new response's breaks. */
 function swapSurface(surface) {
   state.surface = surface;
-  if (surfaceLayer) { surfaceLayer.remove(); surfaceLayer = null; }
+  state.layers = (surface && surface.layers) || [];
+  clearSurfaceLayers();
   if (state.surfaceActive) {
-    surfaceLayer = L.imageOverlay(surface.image, surface.bounds, {
-      opacity: 1, interactive: false, className: 'r0-surface',
-    }).addTo(map);
+    addSurfaceLayers(surface);
     if (cellLayer) cellLayer.bringToFront();
   }
   state.legendMap = {};
@@ -1696,14 +2072,16 @@ function setMonth(m) {
 }
 
 function wireControls() {
-  // Region
-  const sel = $('#regionSelect');
-  sel.addEventListener('change', () => {
-    // Region change STAGES the query; it does not auto-compute. The user runs it.
-    state.region = state.regions.find((r) => r.code === sel.value) || state.regions[0];
-    updateComputeMeta();
-    markDirty();
-  });
+  // Region presets. Selection STAGES the query; it never auto-computes — the
+  // user still runs it, exactly as with the old single select.
+  const preset = (id, codes) => {
+    const b = $(id);
+    if (b) b.addEventListener('click', () => setSelection(codes()));
+  };
+  preset('#presetStudy', () =>
+    STUDY_CODES.filter(regionByCode));            // guard: only codes we actually have
+  preset('#presetAll', () => state.regions.map((r) => r.code));
+  preset('#presetClear', () => []);
 
   // Basemap place-labels toggle
   const labelsBtn = $('#labelsToggle');
@@ -1811,13 +2189,13 @@ async function init() {
   state.sources = state.sourcesLive ? caps : CONFIG.sourcesFallback.slice();
   renderSourceOptions();
 
-  const sel = $('#regionSelect');
-  sel.innerHTML = state.regions
-    .map((r) => `<option value="${esc(r.code)}">${esc(r.name)}</option>`)
-    .join('');
-  // Pre-select a representative region (NOT computed) so the first run is one click.
-  state.region = state.regions.find((r) => r.code === 'KEN') || state.regions[0];
-  if (state.region) sel.value = state.region.code;
+  renderRegionPicker();
+  // Pre-select ONE representative country (not computed) so the first run stays
+  // a single click and the default experience is unchanged from the old select.
+  const first = regionByCode('KEN') || state.regions[0];
+  state.selected = first ? [first.code] : [];
+  state.region = first || null;
+  syncRegionPicker();
 
   // Year input spans every source on offer; the note explains any substitution.
   const [ylo, yhi] = yearSpan();

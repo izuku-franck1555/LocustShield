@@ -68,6 +68,24 @@ def presets() -> List[Dict[str, str]]:
 
 # --- local boundary store --------------------------------------------------
 def _local_boundary_path(code: str, level: int) -> str:
+    """Path of a cached boundary. ``code``/``level`` become a FILENAME.
+
+    Both components are validated because this path is written to, not just
+    read: a malformed value creates persistent junk in a tracked directory
+    rather than failing. That is not hypothetical — a leaked FastAPI ``Query``
+    object once reached here and wrote three files literally named
+    ``KEN_annotation=int required=False default=0 alias='level' ...geojson``,
+    which would have been committed. Fail loudly instead.
+    """
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        raise TypeError(
+            f"boundary level must be an int, got {type(level).__name__}: "
+            f"{level!r}"
+        )
+    if not (isinstance(code, str) and code.isalnum()):
+        raise ValueError(f"boundary code must be alphanumeric, got {code!r}")
     return os.path.join(BOUNDARIES_DIR, f"{code}_{level}.geojson")
 
 

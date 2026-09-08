@@ -117,8 +117,8 @@ denominator `(1-omega)*(1-epsilon) <= 1e-3`). `classify_r0` bins a value into
 | GET | `/api/sources` | climate-source capabilities for the source picker |
 | GET | `/api/coverage` | `mode`, `month`, `year`, `source` — which source a slice would use, without rendering it |
 | GET | `/api/r0` | params: `region`, `level` (0), `mode` (`climatology`\|`month`), `month` (1–12), `year` (for `month`), `ramp` (`bins`\|`continuous`), `source` (default `power`) |
-| GET | `/api/r0_surface` | same params plus `source` (`chelsa`\|`power`\|`auto`, default `auto`) and `scale` (`absolute`\|`relative`, default `absolute`) |
-| GET | `/api/r0_point` | `lat`, `lon`, `region`, `level`, `mode`, `month`, `year`, `source` — one sampled pixel |
+| GET | `/api/r0_surface` | `region` **or** `regions` (multi), plus `source` (`chelsa`\|`power`\|`auto`, default `auto`) and `scale` (`absolute`\|`relative`, default `absolute`) |
+| GET | `/api/r0_point` | `lat`, `lon`, `region` **or** `regions`, `level`, `mode`, `month`, `year`, `source` — one sampled pixel |
 | GET | `/api/occurrences?region=CODE` | GeoJSON points from `data/occurrences/<CODE>.csv` |
 | POST | `/api/occurrences` | multipart CSV upload (`file`); optional `?region=CODE` persists it |
 
@@ -169,6 +169,76 @@ report the source actually used in `meta.source` / `meta.source_id`.
   structure in a field that clusters near R0 = 1; do not compare two relative
   maps to each other. (It restyles the classified render; the continuous ramp
   keeps its fixed domain.)
+
+### Multiple regions
+
+`/api/r0_surface?regions=KEN,ETH,SOM` computes several countries at once and
+returns them as **layers** — one raster per country, not one raster over the
+union:
+
+```jsonc
+{
+  "layers": [ {"code","name","image","bounds","boundary","meta"}, ... ],
+  "failed": [ {"code","name","reason"}, ... ],   // [] when all succeeded
+  "bbox": [w,s,e,n],   // union, for fitting the map only — never read from
+  "legend": [...],     // shared across layers
+  "meta": { ...aggregate... }
+}
+```
+
+**Partial success.** If some regions compute and others fail, the response is
+still a 200 carrying the layers that worked, with every failure named in
+`failed[]`. One region's transient fetch error does not discard four good
+results, and nothing is degraded or dropped silently. Aggregates describe what
+actually rendered (`regions`, `n_regions`) alongside what was asked for
+(`regions_requested`, `n_requested`, `n_failed`), so a partial result is never
+ambiguous. If **every** region fails the request errors rather than returning
+an empty success. An impossible time slice is caught up front as a 400 — the
+same status the single-region path returns — because source availability is
+temporal and does not depend on the region.
+
+**Why per-country rather than a union bbox.** A union over a non-adjacent
+selection is mostly empty ocean and desert, and its size forces heavy
+decimation. Measured, Morocco + Kenya: the union spans 59° × 41° ≈ **34.5 M
+pixels** at native 1 km, whereas reading each country separately touches
+**3.7 M** — 9.4× less work — and keeps Kenya at full native resolution instead
+of degrading it to fit a box that is mostly sea.
+
+* Countries are fetched and computed **concurrently** (pool of 4). Measured on
+  cold data, three countries take 5.2 s together versus 9.0 s as three separate
+  single-region calls; warm, 0.42 s. Wall time tracks the slowest country, not
+  the sum. Caching is per country, so an already-computed country is instant.
+* Order is preserved, duplicates collapse, and the cap is
+  `MAX_REGIONS` (12) — beyond it, a 400. Unknown codes 400 *before* any climate
+  work, because boundaries resolve first.
+* `region=` and `regions=` are mutually exclusive; single-region responses are
+  byte-compatible with before.
+
+**Provenance stays per layer.** Each layer's `meta` carries its own `source`,
+`resolution`, `render` and R0 statistics. The aggregate `meta` reports
+`per_region`, plus `mixed_sources` / `mixed_resolutions`; when they differ the
+aggregate says `"mixed"` rather than picking one source and implying it covers
+everything, and `provenance_note` names what differs — resolutions when the
+source is uniform, sources otherwise. A mixed-source selection carries both
+sources' caveats.
+
+**`scale=relative` pools across layers.** The legend is shared, so the stretch
+must be too: breaks are quintiles of every selected region's values combined
+(successful ones only). Per-layer stretches would each be honest alone but
+would make one legend describe five different mappings, and the layers would
+not be comparable to each other. `meta.scale_note` states the pooling
+explicitly so nobody assumes per-country stretching.
+
+`/api/r0_point?regions=...` resolves the probe to whichever selected country
+contains the point and samples that country's raster — the same one its layer
+was rendered from — returning clean nulls (HTTP 200) outside them all.
+
+`/api/coverage?regions=...` adds a per-region resolution forecast. CHELSA
+availability is temporal, but *resolution* is regional, since a large country
+gets decimated — so the UI can warn "2 of 4 at native 1 km" before a
+multi-second render. The estimate is computed from bbox size and the pixel
+budget alone, needs no network, and is asserted against a real read in the
+tests.
 
 `/api/r0_point` samples a single coordinate from the cached raster —
 `{ r0, t, rh, cls, meta }`, with `rh` in percent and all four null (HTTP 200,

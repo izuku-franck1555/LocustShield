@@ -17,7 +17,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Spectral:wght@400;500;600&display=swap" rel="stylesheet" />
 
-  <link rel="stylesheet" href="style.css?v=15" />
+  <link rel="stylesheet" href="style.css?v=19" />
 </head>
 <body>
   <div class="app" id="app">
@@ -54,15 +54,22 @@
           <!-- ===== QUERY: what to compute (region + time) ===== -->
           <p class="panel__eyebrow" style="--i:0">Set up the map</p>
 
-          <!-- Region -->
+          <!-- Regions — multi-select. Rows toggle; "only" selects exclusively so
+               the common single-country case stays a one-click change. -->
           <section class="field" style="--i:1">
-            <label class="field__label" for="regionSelect">
-              <span class="field__num">01</span> Region
-            </label>
-            <div class="select">
-              <select id="regionSelect" aria-label="Select region"></select>
-              <svg class="select__chev" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 4l4 4 4-4"/></svg>
+            <span class="field__label" id="regionLabel">
+              <span class="field__num">01</span> Regions
+              <span class="field__value mono" id="regionCount">—</span>
+            </span>
+            <div class="picker">
+              <div class="picker__actions">
+                <button type="button" class="picker__act" id="presetStudy">Study countries</button>
+                <button type="button" class="picker__act" id="presetAll">All</button>
+                <button type="button" class="picker__act" id="presetClear">Clear</button>
+              </div>
+              <ul class="picker__list" id="regionList" role="group" aria-labelledby="regionLabel"></ul>
             </div>
+            <p class="note" id="regionNote" hidden></p>
           </section>
 
           <!-- Climate source (capabilities come from GET /api/sources) -->
@@ -149,6 +156,9 @@
           <section class="readout" id="metaBox" style="--i:11" hidden>
             <h2 class="readout__title">Field metadata</h2>
             <dl class="readout__grid mono" id="metaGrid"></dl>
+            <!-- Per-country provenance: a mixed selection can legitimately resolve
+                 to different sources, and that must stay visible per country. -->
+            <div class="readout__regions" id="metaRegions" hidden></div>
             <p class="readout__note" id="metaNote" hidden></p>
           </section>
 
@@ -233,6 +243,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=15" defer></script>
+  <script src="app.js?v=19" defer></script>
 </body>
 </html>

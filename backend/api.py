@@ -25,11 +25,13 @@ import csv
 import io
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 import numpy as np
 import shapely
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import params as _fastapi_params
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -267,6 +269,118 @@ def _resolve_source(source: str, mode: str, month: int, year: Optional[int]):
     if reason:
         return "power", f"CHELSA unavailable ({reason}); served from NASA POWER."
     return "chelsa", None
+
+
+# --- multi-region selection ------------------------------------------------
+#: Upper bound on regions per request. Each one is an independent raster read,
+#: so this caps both the fan-out and the response size.
+MAX_REGIONS = 12
+
+#: Countries are read concurrently; the work is dominated by remote range
+#: reads, so a small pool hides most of the latency without hammering the
+#: object store.
+_REGION_POOL = 4
+
+#: Base class of every FastAPI parameter marker (Query, Path, Header, ...).
+#: Used to detect a default that never went through dependency injection.
+_PARAM_SENTINEL = _fastapi_params.Param
+
+
+def _query_val(value, name: str = "parameter"):
+    """Resolve a parameter that may still hold FastAPI's ``Query`` sentinel.
+
+    These endpoint functions are also called directly — from tests, and
+    potentially from other endpoints. Called that way FastAPI's dependency
+    injection never runs, so any parameter left unsupplied arrives as the
+    ``Query(...)`` object itself instead of its declared default.
+
+    That is nastier than it looks, in two different ways:
+      * a leaked sentinel is truthy, so an unsupplied optional *string*
+        silently selected the multi-region branch;
+      * an unsupplied *int* (``level``) reached numeric code and surfaced as a
+        per-region "CHELSA fetch failed" — which partial success then reports
+        as a failed REGION rather than as the bug it is.
+
+    So unwrap to the declared default (no need to repeat it here — the sentinel
+    carries it), and raise loudly for a genuinely required parameter rather
+    than letting a sentinel travel deeper into the call stack.
+    """
+    if not isinstance(value, _PARAM_SENTINEL):
+        return value
+    default = getattr(value, "default", None)
+    if default is Ellipsis or type(default).__name__ == "PydanticUndefinedType":
+        raise TypeError(
+            f"{name!r} is required and was not supplied — this endpoint was "
+            "called directly, bypassing FastAPI's parameter injection"
+        )
+    return default
+
+
+def _parse_regions(raw: str) -> List[str]:
+    """Parse ``regions=KEN,ETH,SOM`` into a validated, de-duplicated list.
+
+    Order is preserved (the client's selection order is the layer order) and
+    repeats collapse to the first occurrence, so a duplicated code cannot be
+    computed twice or eat into the cap.
+    """
+    codes: List[str] = []
+    for part in (raw or "").split(","):
+        code = part.strip().upper()
+        if not code:
+            continue
+        if code not in codes:
+            codes.append(code)
+    if not codes:
+        raise HTTPException(
+            status_code=400, detail="regions must list at least one ISO3 code"
+        )
+    bad = [c for c in codes if not (len(c) == 3 and c.isalpha())]
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=f"not valid ISO3 codes: {', '.join(bad)}",
+        )
+    if len(codes) > MAX_REGIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"too many regions: {len(codes)} requested, maximum is "
+                f"{MAX_REGIONS}"
+            ),
+        )
+    return codes
+
+
+def _resolve_many(codes: List[str], level: int):
+    """Resolve every region's boundary up front.
+
+    Boundaries come from the local store, so this is cheap — and doing it
+    before any climate work means an unknown code fails fast with a clear 400
+    instead of surfacing partway through a multi-second fan-out.
+    """
+    resolved = {}
+    failed = []
+    for code in codes:
+        try:
+            geom, boundary_geojson = regions.get_boundary(code, level)
+        except Exception:  # noqa: BLE001 - unknown / unresolvable region
+            failed.append(code)
+            continue
+        resolved[code] = (geom, boundary_geojson, regions.bounds_of(geom))
+    if failed:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "could not resolve region code(s): " + ", ".join(failed)
+            ),
+        )
+    return resolved
+
+
+def _union_bbox(bboxes):
+    """Union of (w, s, e, n) boxes — used only to fit the map, never to read."""
+    ws, ss, es, ns = zip(*bboxes)
+    return [min(ws), min(ss), max(es), max(ns)]
 
 
 def _resolve_bbox(region: str, level: int):
@@ -655,9 +769,294 @@ def _surface_from_power(geom, bbox, mode, month, year, level, region):
     return Z, inside, (w, s, e, n), extra
 
 
+def _compute_region_field(code, level, mode, month, year, source, resolved):
+    """Compute one country's R0 field. Runs on the worker pool.
+
+    Returns everything needed to render the layer later; rendering is deferred
+    because a relative colour stretch has to see every region's values first.
+    """
+    geom, boundary_geojson, bbox = resolved[code]
+    source_id, source_note = _resolve_source(source, mode, month, year)
+    if source_id == "chelsa":
+        Z, inside, out_bounds, extra = _surface_from_chelsa(
+            geom, bbox, mode, month, year
+        )
+    else:
+        Z, inside, out_bounds, extra = _surface_from_power(
+            geom, bbox, mode, month, year, level, code
+        )
+    return {
+        "code": code,
+        "name": regions.PRESETS.get(code, code),
+        "geom": geom,
+        "boundary": boundary_geojson,
+        "Z": Z,
+        "inside": inside,
+        "bounds": out_bounds,
+        "extra": extra,
+        "source_id": source_id,
+        "source_note": source_note,
+    }
+
+
+def _render_region_layer(field, ramp, scale_used, breaks, source, level,
+                         mode, month, year):
+    """Turn one computed field into a response layer (PNG + per-layer meta)."""
+    Z, inside = field["Z"], field["inside"]
+    valid = inside & np.isfinite(Z)
+    vals_in = Z[valid]
+    n_valid = int(valid.sum())
+
+    cls_index = None
+    if scale_used == "relative" and breaks is not None:
+        cls_index = _classify_by_breaks(np.where(valid, Z, np.nan), breaks)
+    image_b64 = _render_surface_png(Z, inside, ramp, cls_index=cls_index)
+
+    w, s, e, n = field["bounds"]
+    source_id = field["source_id"]
+    meta = {
+        "region": field["code"],
+        "level": level,
+        "mode": mode,
+        "month": month,
+        "year": year,
+        "ramp": ramp,
+        "scale": scale_used,
+        "source": _SOURCE_LABEL[source_id],
+        "source_id": source_id,
+        "source_requested": source,
+        "resolution": _SOURCE_RESOLUTION[source_id],
+        "n_cells": n_valid,
+        "n_valid_px": n_valid,
+        "r0_min": round(float(np.min(vals_in)), 4) if n_valid else None,
+        "r0_max": round(float(np.max(vals_in)), 4) if n_valid else None,
+        "r0_mean": round(float(np.mean(vals_in)), 4) if n_valid else None,
+        "caveats": _caveats(source_id),
+    }
+    meta.update(field["extra"])
+    if field["source_note"]:
+        meta["source_note"] = field["source_note"]
+
+    return {
+        "code": field["code"],
+        "name": field["name"],
+        "image": "data:image/png;base64," + image_b64,
+        "bounds": [[s, w], [n, e]],
+        "boundary": field["boundary"],
+        "meta": meta,
+    }, vals_in
+
+
+def _multi_region_surface(codes, level, mode, month, year, ramp, source, scale):
+    """Compute several countries as independent layers.
+
+    Deliberately NOT a union bounding box: for a non-adjacent selection the
+    union is mostly empty ocean and desert, and its size would force heavy
+    decimation that throws away the native resolution. Reading each country
+    separately keeps every one at its own best resolution and skips the gaps.
+    """
+    started = time.time()
+    # Source availability is temporal, not regional, so an impossible time
+    # slice is a BAD REQUEST, not an upstream failure. Check it once up front
+    # and let it raise 400 — matching the single-region path — instead of
+    # letting every worker fail and reporting the result as a 502.
+    _resolve_source(source, mode, month, year)
+    resolved = _resolve_many(codes, level)
+
+    # Phase 1 — compute every country's field concurrently.
+    fields = [None] * len(codes)
+    errors = {}
+    with ThreadPoolExecutor(max_workers=_REGION_POOL) as pool:
+        futures = {
+            pool.submit(
+                _compute_region_field,
+                code, level, mode, month, year, source, resolved,
+            ): idx
+            for idx, code in enumerate(codes)
+        }
+        for future, idx in futures.items():
+            try:
+                fields[idx] = future.result()
+            except HTTPException as exc:
+                errors[codes[idx]] = exc.detail
+            except Exception as exc:  # noqa: BLE001
+                errors[codes[idx]] = str(exc)
+
+    # Partial success: one country failing must not discard the others' work,
+    # but the failure is named rather than hidden — a region is never quietly
+    # served at a degraded resolution or silently dropped from the map.
+    ok_fields = [field for field in fields if field is not None]
+    failed = [
+        {
+            "code": code,
+            "name": regions.PRESETS.get(code, code),
+            "reason": str(errors[code]),
+        }
+        for code in codes
+        if code in errors
+    ]
+    if not ok_fields:
+        detail = "; ".join(f"{code}: {msg}" for code, msg in errors.items())
+        raise HTTPException(status_code=502, detail=f"region compute failed — {detail}")
+    fields = ok_fields
+
+    # Phase 2 — a relative stretch must be SHARED across layers, or the single
+    # top-level legend would not describe what any given layer is coloured by.
+    # Breaks therefore come from the pooled values of every region.
+    scale_used = "absolute"
+    breaks = None
+    break_list = None
+    legend = LEGEND
+    pooled = np.concatenate(
+        [f["Z"][f["inside"] & np.isfinite(f["Z"])].ravel() for f in fields]
+    ) if fields else np.array([])
+    if scale == "relative":
+        breaks = _relative_breaks(pooled)
+        if breaks is not None:
+            scale_used = "relative"
+            break_list = [round(float(b), 4) for b in breaks]
+            legend = _relative_legend(
+                breaks, float(np.min(pooled)), float(np.max(pooled))
+            )
+
+    # Phase 3 — render each layer against the shared classification.
+    layers = []
+    for field in fields:
+        layer, _vals = _render_region_layer(
+            field, ramp, scale_used, breaks, source, level, mode, month, year
+        )
+        layers.append(layer)
+
+    # --- aggregate meta ----------------------------------------------------
+    per_region = [
+        {
+            "code": layer["code"],
+            "name": layer["name"],
+            "source": layer["meta"]["source"],
+            "source_id": layer["meta"]["source_id"],
+            "resolution": layer["meta"]["resolution"],
+            "render": layer["meta"].get("render"),
+            "n_valid_px": layer["meta"]["n_valid_px"],
+        }
+        for layer in layers
+    ]
+    source_ids = sorted({r["source_id"] for r in per_region})
+    resolutions = sorted({r["resolution"] for r in per_region})
+    # NOTE: mixed_sources is currently UNREACHABLE — _resolve_source() depends
+    # only on (source, mode, month, year), never on the region, so every region
+    # in one request resolves to the same source. Kept (and tested) because it
+    # goes live the moment source selection ever varies per region; don't spend
+    # time debugging it as a phantom. mixed_resolutions IS reachable and common:
+    # a large country is decimated while a small one stays native.
+    mixed_sources = len(source_ids) > 1
+    mixed_resolutions = len(resolutions) > 1
+    n_valid = int(pooled.size)
+
+    meta = {
+        # Aggregates describe what actually RENDERED. What was asked for is
+        # reported separately so a partial result is never ambiguous.
+        "regions": [layer["code"] for layer in layers],
+        "n_regions": len(layers),
+        "regions_requested": list(codes),
+        "n_requested": len(codes),
+        "n_failed": len(failed),
+        "level": level,
+        "mode": mode,
+        "month": month,
+        "year": year,
+        "ramp": ramp,
+        "scale": scale_used,
+        "source_requested": source,
+        # Provenance stays per layer; the aggregate says "mixed" rather than
+        # picking one source and implying it covers everything.
+        "source": (
+            "mixed (" + ", ".join(_SOURCE_LABEL[s] for s in source_ids) + ")"
+            if mixed_sources
+            else _SOURCE_LABEL[source_ids[0]] if source_ids else None
+        ),
+        "source_ids": source_ids,
+        "mixed_sources": mixed_sources,
+        "resolution": "mixed" if mixed_resolutions else (
+            resolutions[0] if resolutions else None
+        ),
+        "mixed_resolutions": mixed_resolutions,
+        "per_region": per_region,
+        "n_cells": n_valid,
+        "n_valid_px": n_valid,
+        "r0_min": round(float(np.min(pooled)), 4) if n_valid else None,
+        "r0_max": round(float(np.max(pooled)), 4) if n_valid else None,
+        "r0_mean": round(float(np.mean(pooled)), 4) if n_valid else None,
+        "elapsed_s": round(time.time() - started, 2),
+        "caveats": _caveats(source_ids[0] if len(source_ids) == 1 else "chelsa"),
+    }
+    if mixed_sources or mixed_resolutions:
+        # Say what actually differs. Grouping by source is uninformative when
+        # every region shares one source and only the resolution varies.
+        if mixed_sources:
+            parts = []
+            for source_id in source_ids:
+                members = [
+                    r["code"] for r in per_region if r["source_id"] == source_id
+                ]
+                parts.append(f"{_SOURCE_LABEL[source_id]}: {', '.join(members)}")
+            what = "source"
+        else:
+            parts = [f"{r['code']}: {r['resolution']}" for r in per_region]
+            what = "resolution"
+        meta["provenance_note"] = (
+            f"regions in this selection do not share one {what} — "
+            + "; ".join(parts)
+            + ". Per-layer meta is authoritative."
+        )
+        if mixed_sources:
+            # Caveats differ per source; carry both so nothing is dropped.
+            merged = []
+            for source_id in source_ids:
+                for caveat in _caveats(source_id):
+                    if caveat not in merged:
+                        merged.append(caveat)
+            meta["caveats"] = merged
+    if break_list is not None:
+        meta["breaks"] = break_list
+    if scale_used == "relative":
+        note = (
+            "breaks are quintiles POOLED across all selected regions, not "
+            "stretched per country — one shared legend describes every layer "
+            "and the layers stay comparable with each other"
+        )
+        if ramp == "continuous":
+            note += (
+                ". The continuous ramp keeps its fixed [0.8, 1.1] domain"
+            )
+        meta["scale_note"] = note
+    notes = {
+        layer["meta"]["source_note"]
+        for layer in layers
+        if layer["meta"].get("source_note")
+    }
+    if notes:
+        meta["source_note"] = " ".join(sorted(notes))
+
+    return JSONResponse(
+        {
+            "layers": layers,
+            # Empty when everything succeeded; populated names what did not.
+            "failed": failed,
+            "bbox": _union_bbox([f["bounds"] for f in fields]),
+            "legend": legend,
+            "meta": meta,
+        }
+    )
+
+
 @app.get("/api/r0_surface")
 def get_r0_surface(
-    region: str = Query(..., description="ISO3 region code, e.g. KEN"),
+    region: Optional[str] = Query(None, description="ISO3 region code, e.g. KEN"),
+    region_codes: Optional[str] = Query(
+        None,
+        alias="regions",
+        description="Comma-separated ISO3 codes, e.g. KEN,ETH,SOM",
+    ),
     level: int = Query(0, ge=0, le=2),
     mode: str = Query("climatology", pattern="^(climatology|month)$"),
     month: int = Query(..., ge=1, le=12),
@@ -666,9 +1065,37 @@ def get_r0_surface(
     source: str = Query("auto", pattern="^(chelsa|power|auto)$"),
     scale: str = Query("absolute", pattern="^(absolute|relative)$"),
 ):
+    # Normalise EVERY parameter, not just the ones that have bitten us: a
+    # sentinel leaking through any of them is the same class of bug.
+    region = _query_val(region, "region")
+    region_codes = _query_val(region_codes, "regions")
+    level = _query_val(level, "level")
+    mode = _query_val(mode, "mode")
+    month = _query_val(month, "month")
+    year = _query_val(year, "year")
+    ramp = _query_val(ramp, "ramp")
+    source = _query_val(source, "source")
+    scale = _query_val(scale, "scale")
+
     if mode == "month" and year is None:
         raise HTTPException(
             status_code=400, detail="year is required when mode='month'"
+        )
+    # Multi-region: one layer per country. Everything below this branch is the
+    # original single-region path, unchanged, so `region=` stays byte-compatible.
+    if region_codes is not None:
+        if region is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="pass either region= or regions=, not both",
+            )
+        return _multi_region_surface(
+            _parse_regions(region_codes),
+            level, mode, month, year, ramp, source, scale,
+        )
+    if region is None:
+        raise HTTPException(
+            status_code=400, detail="region or regions is required"
         )
     started = time.time()
     source_id, source_note = _resolve_source(source, mode, month, year)
@@ -757,11 +1184,34 @@ def get_r0_surface(
     )
 
 
+def _region_containing(codes: List[str], level: int, lat: float, lon: float):
+    """First selected region whose polygon contains the point, else None."""
+    from shapely.geometry import Point
+    from shapely.prepared import prep
+
+    probe = Point(lon, lat)
+    resolved = _resolve_many(codes, level)
+    for code in codes:
+        geom = resolved[code][0]
+        try:
+            if prep(geom).contains(probe):
+                return code
+        except Exception:  # noqa: BLE001 - degenerate geometry
+            continue
+    return None
+
+
 @app.get("/api/r0_point")
 def get_r0_point(
     lat: float = Query(..., ge=-90.0, le=90.0),
     lon: float = Query(..., ge=-180.0, le=180.0),
-    region: str = Query(..., description="ISO3 region code, e.g. KEN"),
+    region: Optional[str] = Query(None, description="ISO3 region code, e.g. KEN"),
+    region_codes: Optional[str] = Query(
+        None,
+        alias="regions",
+        description="Comma-separated ISO3 codes; the probe resolves to "
+                    "whichever selected region contains the point",
+    ),
     level: int = Query(0, ge=0, le=2),
     mode: str = Query("climatology", pattern="^(climatology|month)$"),
     month: int = Query(..., ge=1, le=12),
@@ -774,10 +1224,50 @@ def get_r0_point(
     the client asks for the single pixel under the cursor. Reads the cached
     raster, so it is near-instant once the surface has been rendered.
     Returns nulls (not an error) where there is no data.
+
+    With ``regions=`` the probe first resolves which selected country contains
+    the point, then samples that country's raster — the same one its layer was
+    rendered from, so the probe and the map always agree.
     """
+    lat = _query_val(lat, "lat")
+    lon = _query_val(lon, "lon")
+    region = _query_val(region, "region")
+    region_codes = _query_val(region_codes, "regions")
+    level = _query_val(level, "level")
+    mode = _query_val(mode, "mode")
+    month = _query_val(month, "month")
+    year = _query_val(year, "year")
+    source = _query_val(source, "source")
+
     if mode == "month" and year is None:
         raise HTTPException(
             status_code=400, detail="year is required when mode='month'"
+        )
+    if region_codes is not None:
+        if region is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="pass either region= or regions=, not both",
+            )
+        codes = _parse_regions(region_codes)
+        region = _region_containing(codes, level, lat, lon)
+        if region is None:
+            # Outside every selected country: not an error, just no data.
+            return JSONResponse(
+                {
+                    "r0": None, "t": None, "rh": None, "cls": None,
+                    "meta": {
+                        "regions": codes,
+                        "region": None,
+                        "mode": mode, "month": month, "year": year,
+                        "lat": lat, "lon": lon,
+                        "note": "point is outside every selected region",
+                    },
+                }
+            )
+    if region is None:
+        raise HTTPException(
+            status_code=400, detail="region or regions is required"
         )
     source_id, source_note = _resolve_source(source, mode, month, year)
     geom, _boundary, bbox = _resolve_bbox(region, level)
@@ -926,18 +1416,64 @@ def get_sources():
     }
 
 
+def _estimate_region_grid(bbox):
+    """Predict the CHELSA grid a bbox would produce, without fetching it.
+
+    Decimation depends only on the window size and the pixel budget, both known
+    up front — so the UI can be told "this one will be resampled" before any
+    multi-second read starts. Approximate to +/-1 pixel; the served response
+    reports the exact figures.
+    """
+    w, s, e, n = bbox
+    native = chelsa_mod.NATIVE_RES_DEG
+    nx = max(1, int(round((e - w) / native)))
+    ny = max(1, int(round((n - s) / native)))
+    out_ny, out_nx = chelsa_mod.decimated_shape(ny, nx, _chelsa.max_pixels)
+    res_deg = (e - w) / out_nx if out_nx else native
+    return {
+        "shape": [out_ny, out_nx],
+        "resolution_deg": round(float(res_deg), 6),
+        "decimated": _is_decimated(res_deg, native),
+        "resolution": _resolution_label(res_deg, native),
+    }
+
+
 @app.get("/api/coverage")
 def get_coverage(
-    mode: str = Query("month", pattern="^(climatology|month)$"),
+    # Must match /api/r0_surface's default. This endpoint exists so the UI's
+    # advice cannot drift from what the surface endpoint actually does; a
+    # different default here would reintroduce that drift at the signature
+    # level, and the same request would be predicted one way and served
+    # another. Guarded by test_shared_defaults_agree_across_endpoints.
+    mode: str = Query("climatology", pattern="^(climatology|month)$"),
     month: int = Query(..., ge=1, le=12),
     year: Optional[int] = Query(None),
     source: str = Query("auto", pattern="^(chelsa|power|auto)$"),
+    region_codes: Optional[str] = Query(
+        None,
+        alias="regions",
+        description="Optional comma-separated ISO3 codes for a per-region "
+                    "resolution breakdown",
+    ),
+    level: int = Query(0, ge=0, le=2),
 ):
     """Answer "would this time slice render at 1 km?" without computing it.
 
     Lets the time picker warn BEFORE the user triggers a multi-second render,
     using exactly the rule the surface endpoint will apply.
+
+    With ``regions=`` it also reports, per region, the resolution that
+    selection would actually get — CHELSA availability is temporal, but
+    *resolution* is regional, because a large country is decimated to stay
+    inside the pixel budget. That is what lets the UI say "3 of 5 at 1 km".
     """
+    mode = _query_val(mode, "mode")
+    month = _query_val(month, "month")
+    year = _query_val(year, "year")
+    source = _query_val(source, "source")
+    region_codes = _query_val(region_codes, "regions")
+    level = _query_val(level, "level")
+
     reason = _chelsa.unsupported_reason(mode, year, month)
     chelsa_ok = reason is None
     if source == "power":
@@ -946,7 +1482,8 @@ def get_coverage(
         resolved, note = ("chelsa", None) if chelsa_ok else (None, reason)
     else:
         resolved, note = _resolve_source("auto", mode, month, year)
-    return {
+
+    payload = {
         "mode": mode,
         "month": month,
         "year": year,
@@ -959,6 +1496,50 @@ def get_coverage(
         "would_error": resolved is None,
         "note": note,
     }
+
+    if region_codes is None:
+        return payload
+
+    codes = _parse_regions(region_codes)
+    resolved_regions = _resolve_many(codes, level)
+    per_region = []
+    n_native = 0
+    for code in codes:
+        bbox = resolved_regions[code][2]
+        entry = {
+            "code": code,
+            "name": regions.PRESETS.get(code, code),
+            "resolved_source": resolved,
+            "resolved_label": _SOURCE_LABEL[resolved] if resolved else None,
+        }
+        if resolved == "chelsa":
+            estimate = _estimate_region_grid(bbox)
+            entry.update(estimate)
+            entry["estimated"] = True
+            if not estimate["decimated"]:
+                n_native += 1
+        else:
+            entry["resolution"] = (
+                _SOURCE_RESOLUTION[resolved] if resolved else None
+            )
+            entry["decimated"] = False
+            entry["estimated"] = False
+        per_region.append(entry)
+
+    payload["regions"] = codes
+    payload["n_regions"] = len(codes)
+    payload["per_region"] = per_region
+    payload["n_native_1km"] = n_native
+    payload["summary"] = (
+        f"{n_native} of {len(codes)} at native 1 km"
+        if resolved == "chelsa"
+        else (
+            f"all {len(codes)} from {_SOURCE_LABEL[resolved]}"
+            if resolved
+            else "unavailable for this time slice"
+        )
+    )
+    return payload
 
 
 # --- occurrences -----------------------------------------------------------

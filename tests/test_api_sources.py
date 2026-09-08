@@ -217,6 +217,83 @@ def test_surface_keeps_every_pre_existing_key(monkeypatch, source):
     assert payload["bbox"] == [33.91, -4.70, 41.91, 5.43]
 
 
+# --- shared parameter defaults must agree across endpoints ----------------
+# /api/coverage exists to predict what /api/r0_surface will do, and
+# /api/r0_point probes the raster /api/r0_surface rendered. If a shared
+# parameter defaults differently between them, the same request is predicted
+# one way and served another — the advice drifts from the behaviour at the
+# SIGNATURE level, which no amount of shared logic underneath can prevent.
+_AGREEING_ENDPOINTS = ("get_r0_surface", "get_r0_point", "get_coverage")
+
+#: Deliberate divergences, with the reason. Anything not listed must match.
+_INTENTIONAL_DIVERGENCE = {
+    ("get_r0", "source"): "cells are a NASA POWER product; source=chelsa 400s",
+    ("get_r0", "region"): "the cells endpoint has no regions=, so region stays required",
+}
+
+
+def _declared_defaults(func):
+    import inspect
+
+    out = {}
+    for name, param in inspect.signature(func).parameters.items():
+        if isinstance(param.default, api._PARAM_SENTINEL):
+            default = param.default.default
+            out[name] = (
+                "REQUIRED"
+                if type(default).__name__ == "PydanticUndefinedType"
+                else default
+            )
+    return out
+
+
+def test_shared_defaults_agree_across_endpoints():
+    """The specific bug: coverage defaulted mode='month', surface 'climatology'."""
+    declared = {
+        name: _declared_defaults(getattr(api, name)) for name in _AGREEING_ENDPOINTS
+    }
+    shared = set.intersection(*(set(d) for d in declared.values()))
+    for param in sorted(shared):
+        values = {name: declared[name][param] for name in _AGREEING_ENDPOINTS}
+        assert len(set(values.values())) == 1, (
+            f"{param!r} defaults differ across endpoints that must agree: "
+            f"{values} — the pre-flight would advise on a different request "
+            "than the one the surface endpoint serves"
+        )
+
+
+def test_coverage_and_surface_agree_on_mode_specifically():
+    assert _declared_defaults(api.get_coverage)["mode"] == "climatology"
+    assert _declared_defaults(api.get_r0_surface)["mode"] == "climatology"
+
+
+def test_coverage_advice_matches_what_the_surface_would_do(monkeypatch):
+    """End-to-end on the defaults: same omitted params, same conclusion."""
+    advice = api.get_coverage(month=7, region_codes="KEN")
+    assert advice["resolved_source"] == "chelsa"
+    # the surface endpoint, given the same omitted parameters, agrees
+    source_id, _note = api._resolve_source(
+        "auto", advice["mode"], 7, None
+    )
+    assert source_id == advice["resolved_source"]
+
+
+def test_cells_endpoint_divergences_are_the_documented_ones():
+    """/api/r0 legitimately differs — but only in the ways we recorded."""
+    cells = _declared_defaults(api.get_r0)
+    surface = _declared_defaults(api.get_r0_surface)
+    for param, value in cells.items():
+        if param not in surface:
+            continue
+        if value == surface[param]:
+            continue
+        assert ("get_r0", param) in _INTENTIONAL_DIVERGENCE, (
+            f"/api/r0 defaults {param!r}={value!r} against "
+            f"{surface[param]!r} on /api/r0_surface, and that divergence is "
+            "not documented as intentional"
+        )
+
+
 # --- /api/sources capability payload --------------------------------------
 def test_sources_payload_shape():
     payload = api.get_sources()
